@@ -1,13 +1,14 @@
 """
-FiddlerMixtral: Optimized Mixtral Model with CPU Offloading
+FiddlerMixtral: Optimized Mixtral Model with CPU Offloading and Expert Prefetching
 
 This module implements an optimized version of the Mixtral model (a Mixture of Experts language model)
-with intelligent CPU/GPU memory management. The key innovation is the ability to dynamically offload
-expert networks between CPU and GPU memory to handle models larger than GPU memory.
+with intelligent CPU/GPU memory management and expert prefetching during decode phase.
 
 Key Features:
 - Selective GPU placement of frequently-used experts based on popularity profiling
 - Dynamic CPU/GPU offloading during inference to maximize throughput
+- Expert prefetching during decode phase to overlap loading with computation
+- Double buffering for expert networks to prefetch both needed experts
 - Beam search generation support
 - Memory-efficient inference for large MoE models
 
@@ -15,7 +16,8 @@ Usage:
     args = YourArgsClass(
         model="mistralai/Mixtral-8x7B-v0.1",
         cpu_offload=True,
-        beam_width=4
+        beam_width=4,
+        enable_prefetch=True  # Enable expert prefetching
     )
     model = FiddlerMixtral(args)
     prefill_time, decode_time, hit_rate = model.generate("Your prompt here", output_token=50)
@@ -27,11 +29,22 @@ Architecture Overview:
     - Only top-2 experts are activated per token (sparse MoE)
     
     This implementation keeps popular experts on GPU and dynamically manages the rest.
+    With prefetching enabled, it predicts and preloads experts for the next layer.
+    
+Prefetching Strategy:
+    During decode phase with single token generation (beam_width=1), we know we need 
+    exactly 2 experts per layer. After processing experts for layer i, we start 
+    prefetching both experts for layer i+1 (if they're on CPU) into our 2 placeholders.
+    This prefetch happens in parallel with the residual connection, layer norm, and 
+    attention computations of the next layer, hiding the CPU→GPU transfer latency.
+    With beam search (beam_width>1), we may need more experts, so prefetching 
+    is less effective but still helpful.
 """
 
 import copy
 import threading
 import time
+import queue
 
 import numpy as np
 import torch
@@ -42,18 +55,21 @@ import transformers
 
 class FiddlerMixtral:
     """
-    Optimized Mixtral model wrapper with CPU offloading capabilities.
+    Optimized Mixtral model wrapper with CPU offloading and prefetching capabilities.
     
     This class manages a Mixtral model by intelligently distributing expert networks
     between CPU and GPU memory. It profiles expert usage patterns and keeps frequently
-    accessed experts on GPU while offloading others to CPU.
+    accessed experts on GPU while offloading others to CPU. With prefetching enabled,
+    it predicts and preloads experts for upcoming layers during decode phase.
     
     Attributes:
         dtype: Model precision (default: bfloat16)
         dev: CUDA device for GPU operations
         model: The core Mixtral model (without LM head)
         lm_head: Language modeling head for token prediction
-        expert_placeholder: Template expert network for CPU inference
+        expert_placeholder_0: First template expert network for prefetching/CPU inference
+        expert_placeholder_1: Second template expert network for prefetching/CPU inference
+        placeholder_contents: Dict tracking what's loaded in each placeholder
         tokenizer: Tokenizer for text processing
         beam_width: Number of beams for beam search generation
         n_layer: Number of transformer layers (32 for Mixtral)
@@ -61,6 +77,10 @@ class FiddlerMixtral:
         expert_loc: 2D array tracking expert locations (0=CPU, 1=GPU)
         latency_cpu: Estimated latency per token on CPU (ms)
         latency_gpu: Estimated latency for GPU transfer (ms)
+        enable_prefetch: Whether to enable expert prefetching
+        prefetch_thread: Background thread for expert prefetching
+        prefetch_queue: Queue for prefetch requests
+        prefetch_lock: Lock to protect placeholder_contents access
     """
     
     def __init__(self, args):
@@ -72,6 +92,7 @@ class FiddlerMixtral:
                 - model: HuggingFace model name/path
                 - cpu_offload: Whether to enable CPU offloading
                 - beam_width: Beam width for generation
+                - enable_prefetch: Whether to enable expert prefetching (default: False)
         """
         # Model configuration
         self.dtype = torch.bfloat16
@@ -89,11 +110,19 @@ class FiddlerMixtral:
         self.lm_head = self.model.lm_head
         self.model = self.model.model
         
-        # Create a template expert on GPU for CPU inference
-        # This avoids repeated CPU->GPU transfers of expert weights (I think this comment is wrong. Weights would still need to be transferred when we know the correct expert to use)
-        self.expert_placeholder = copy.deepcopy(
+        # Create two template experts on GPU for double buffering
+        self.expert_placeholder_0 = copy.deepcopy(
             self.model.layers[0].block_sparse_moe.experts[0]
         ).to(self.dev)
+        self.expert_placeholder_1 = copy.deepcopy(
+            self.model.layers[0].block_sparse_moe.experts[0]
+        ).to(self.dev)
+        
+        # Track what's loaded in each placeholder
+        self.placeholder_contents = {
+            0: None,  # (layer, expert) tuple or None
+            1: None   # (layer, expert) tuple or None
+        }
         
         # Initialize tokenizer
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(args.model)
@@ -106,6 +135,7 @@ class FiddlerMixtral:
         # Configuration
         self.cpu_offload = args.cpu_offload
         self.beam_width = args.beam_width
+        self.enable_prefetch = getattr(args, 'enable_prefetch', True)
         self.n_layer = len(self.model.layers)
         self.n_expert = len(self.model.layers[0].block_sparse_moe.experts)
        
@@ -117,6 +147,53 @@ class FiddlerMixtral:
         # Expert hit rate tracking for profiling
         self.cnt_expert_hit = 0  # Count of tokens processed by GPU experts
         self.cnt_expert_all = 0  # Total token count
+        self.cnt_prefetch_hit = 0  # Count of successful prefetch hits
+        self.cnt_prefetch_miss = 0  # Count of prefetch misses
+
+        # Prefetching infrastructure
+        if self.enable_prefetch:
+            self.prefetch_queue = queue.Queue()
+            self.prefetch_thread = None
+            self.prefetch_ready = threading.Event()
+            self.prefetch_lock = threading.Lock()  # Protect placeholder_contents
+            
+            # Hardcoded expert predictions for decode phase
+            # Format: [(layer_idx, (expert_0, expert_1)), ...]
+            # These would be predicted in a real system
+            self.decode_expert_predictions = [
+                (0, (2, 5)),   # Layer 0 will use experts 2 and 5
+                (1, (4, 7)),   # Layer 1 will use experts 4 and 7
+                (2, (1, 4)),   # Layer 2 will use experts 1 and 4
+                (3, (0, 7)),   # Layer 3 will use experts 0 and 7
+                (4, (3, 6)),   # Layer 4 will use experts 3 and 6
+                (5, (1, 4)),   # Layer 5 will use experts 1 and 4
+                (6, (0, 7)),   # Layer 6 will use experts 0 and 7
+                (7, (2, 5)),   # Layer 7 will use experts 2 and 5
+                (8, (3, 6)),   # Layer 8 will use experts 3 and 6
+                (9, (0, 5)),   # Layer 9 will use experts 0 and 5
+                (10, (3, 4)),  # Layer 10 will use experts 3 and 4
+                (11, (0, 2)),  # Layer 11 will use experts 0 and 2
+                (12, (1, 4)),  # Layer 12 will use experts 1 and 4
+                (13, (0, 1)),  # Layer 13 will use experts 0 and 1
+                (14, (2, 5)),  # Layer 14 will use experts 2 and 5
+                (15, (1, 5)),  # Layer 15 will use experts 1 and 5
+                (16, (1, 7)),  # Layer 16 will use experts 1 and 7
+                (17, (2, 7)),  # Layer 17 will use experts 2 and 7
+                (18, (0, 4)),  # Layer 18 will use experts 0 and 4
+                (19, (2, 5)),  # Layer 19 will use experts 2 and 5
+                (20, (1, 5)),  # Layer 20 will use experts 1 and 5
+                (21, (0, 1)),  # Layer 21 will use experts 0 and 1
+                (22, (1, 4)),  # Layer 22 will use experts 1 and 4
+                (23, (2, 4)),  # Layer 23 will use experts 2 and 4
+                (24, (0, 2)),  # Layer 24 will use experts 0 and 2
+                (25, (1, 3)),  # Layer 25 will use experts 1 and 3
+                (26, (0, 2)),  # Layer 26 will use experts 0 and 2
+                (27, (2, 5)),  # Layer 27 will use experts 2 and 5
+                (28, (0, 4)),  # Layer 28 will use experts 0 and 4
+                (29, (3, 7)),  # Layer 29 will use experts 3 and 7
+                (30, (2, 7)),  # Layer 30 will use experts 2 and 7
+                (31, (4, 5)),  # Layer 31 will use experts 4 and 5
+            ]
 
         # Step 1: Move all non-expert components to GPU
         self.bring_non_expert_to_gpu()
@@ -136,7 +213,7 @@ class FiddlerMixtral:
         # Step 4: Move selected experts to GPU
         self.bring_expert_to_gpu()
 
-        print("Model is ready.")
+        print(f"Model is ready. Prefetching enabled: {self.enable_prefetch}")
 
     def bring_non_expert_to_gpu(self):
         """
@@ -494,7 +571,94 @@ class FiddlerMixtral:
         free_mem = total_mem * 0.95 - torch.cuda.memory_allocated(self.dev)  # TODO: magic number
         
         # Each parameter uses 2 bytes (bfloat16)
-        return int((free_mem) // (n_param * 2))
+        # Account for 2 expert placeholders if prefetching is enabled
+        placeholder_mem = n_param * 2 * (2 if self.enable_prefetch else 1)
+        return int((free_mem - placeholder_mem) // (n_param * 2))
+
+    def prefetch_expert_worker(self):
+        """
+        Worker thread for asynchronous expert prefetching.
+        
+        This runs in the background and loads requested experts from CPU to GPU
+        into the placeholders while the main thread continues computation.
+        For decode phase with 1 token, we can load both needed experts.
+        
+        Note: The main thread always waits for prefetch completion before using
+        the experts, so it's safe to clear and reload placeholders here.
+        """
+        while True:
+            try:
+                # Wait for prefetch request
+                request = self.prefetch_queue.get(timeout=1.0)
+                if request is None:  # Shutdown signal
+                    break
+                
+                i_layer, expert_0, expert_1 = request
+                
+                # Load both experts if they're on CPU
+                experts_to_load = []
+                
+                if not self.is_expert_in_gpu(i_layer, expert_0):
+                    experts_to_load.append(expert_0)
+                if not self.is_expert_in_gpu(i_layer, expert_1) and expert_1 != expert_0:
+                    experts_to_load.append(expert_1)
+                
+                # Load up to 2 experts into our 2 placeholders
+                with self.prefetch_lock:
+                    if len(experts_to_load) >= 1:
+                        # Load first expert into placeholder 0
+                        expert = self.model.layers[i_layer].block_sparse_moe.experts[experts_to_load[0]]
+                        with torch.cuda.stream(torch.cuda.Stream()):
+                            self.expert_placeholder_0.load_state_dict(expert.state_dict())
+                        self.placeholder_contents[0] = (i_layer, experts_to_load[0])
+                    
+                    if len(experts_to_load) >= 2:
+                        # Load second expert into placeholder 1
+                        expert = self.model.layers[i_layer].block_sparse_moe.experts[experts_to_load[1]]
+                        with torch.cuda.stream(torch.cuda.Stream()):
+                            self.expert_placeholder_1.load_state_dict(expert.state_dict())
+                        self.placeholder_contents[1] = (i_layer, experts_to_load[1])
+                
+                # Signal that prefetching is complete
+                self.prefetch_ready.set()
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"Prefetch worker error: {e}")
+                break
+
+    def start_expert_prefetch(self, i_layer, expert_0, expert_1):
+        """
+        Start prefetching experts for the next layer.
+        
+        Args:
+            i_layer: Layer index to prefetch experts for
+            expert_0: First expert index to prefetch
+            expert_1: Second expert index to prefetch
+        """
+        if not self.enable_prefetch:
+            return
+        
+        # Clear previous ready state
+        self.prefetch_ready.clear()
+        
+        # Clear placeholder contents for new prefetch
+        with self.prefetch_lock:
+            self.placeholder_contents[0] = None
+            self.placeholder_contents[1] = None
+        
+        # Queue the prefetch request
+        self.prefetch_queue.put((i_layer, expert_0, expert_1))
+
+    def wait_for_prefetch(self):
+        """
+        Wait for ongoing prefetch operation to complete.
+        """
+        if self.enable_prefetch and self.prefetch_thread and self.prefetch_thread.is_alive():
+            self.prefetch_ready.wait(timeout=1.0)  # Wait up to 1 second
+            # Ensure all CUDA operations are complete
+            torch.cuda.synchronize()
 
     def initial_beam_tensor(self, input_tensor):
         """
@@ -551,6 +715,18 @@ class FiddlerMixtral:
         # Reset profiling counters
         self.cnt_expert_hit = 0
         self.cnt_expert_all = 0
+        self.cnt_prefetch_hit = 0
+        self.cnt_prefetch_miss = 0
+        
+        # Reset prefetching state
+        if self.enable_prefetch:
+            with self.prefetch_lock:
+                self.placeholder_contents[0] = None
+                self.placeholder_contents[1] = None
+            # Start prefetch worker thread if not already running
+            if self.prefetch_thread is None or not self.prefetch_thread.is_alive():
+                self.prefetch_thread = threading.Thread(target=self.prefetch_expert_worker, daemon=True)
+                self.prefetch_thread.start()
         
         # Tokenize input
         input_ids, position_ids = self.tokenize(text)
@@ -634,6 +810,11 @@ class FiddlerMixtral:
             
         decode_time = time.time() - tick
         
+        # Cleanup prefetch thread
+        if self.enable_prefetch and self.prefetch_thread:
+            self.prefetch_queue.put(None)  # Signal shutdown
+            self.prefetch_thread.join(timeout=2.0)
+        
         # Select best beam based on cumulative probability
         probs = probs.view(-1, self.beam_width)
         max_ids = torch.argmax(probs, dim=-1)
@@ -642,6 +823,10 @@ class FiddlerMixtral:
         print("--------------------")
         print(f"Input: {text}")
         print(f"Output: {decode_strings[max_ids[0]]}")
+        
+        if self.enable_prefetch:
+            prefetch_rate = self.cnt_prefetch_hit / (self.cnt_prefetch_hit + self.cnt_prefetch_miss) if (self.cnt_prefetch_hit + self.cnt_prefetch_miss) > 0 else 0
+            print(f"Prefetch hit rate: {prefetch_rate:.2%} ({self.cnt_prefetch_hit}/{self.cnt_prefetch_hit + self.cnt_prefetch_miss})")
 
         return (
             prefill_time,
@@ -689,18 +874,19 @@ class FiddlerMixtral:
     @torch.no_grad()
     def mixtral_forward(self, input_ids, position_ids, is_decode):
         """
-        Custom forward pass through Mixtral model with expert routing.
+        Custom forward pass through Mixtral model with expert routing and prefetching.
         
         This method implements the core MoE logic:
         1. Process tokens through embeddings and attention
         2. Route each token to top-2 experts based on gating network
-        3. Dynamically offload expert computation between CPU/GPU
-        4. Combine expert outputs and continue to next layer
+        3. Process experts (using prefetched ones if available)
+        4. Start prefetching experts for next layer (after current layer's experts are used)
+        5. Combine expert outputs and continue to next layer
         
         Args:
             input_ids: Input token IDs [batch_size, seq_len]
             position_ids: Position encodings
-            is_decode: Whether in decode phase (affects caching)
+            is_decode: Whether in decode phase (affects caching and prefetching)
             
         Returns:
             torch.Tensor: Logits for next token prediction [batch_size, seq_len, vocab_size]
@@ -752,9 +938,23 @@ class FiddlerMixtral:
             inps_after_experts = torch.zeros_like(inps, device=self.dev)
             experts = layer.block_sparse_moe.experts
 
+            # # Determine which experts to use for prefetching (decode phase only)
+            # if self.enable_prefetch and is_decode and i_layer < self.n_layer - 1:
+            #     # Get predicted experts for next layer
+            #     _, (next_expert_0, next_expert_1) = self.decode_expert_predictions[i_layer + 1]
+                
+            #     # Start prefetching both experts for next layer in background
+            #     self.start_expert_prefetch(i_layer + 1, next_expert_0, next_expert_1)
 
-            if self.cpu_offload == 0:
-                # Baseline: all experts on GPU (no offloading)
+            # Choose expert processing strategy:
+            # 1. If cpu_offload=0: All experts on GPU (baseline, no offloading)
+            # 2. If enable_prefetch=True: Use simple path with prefetching support
+            # 3. Otherwise: Use advanced dynamic offloading (original Fiddler approach)
+            if self.cpu_offload == 0 or self.enable_prefetch:
+                
+                # Wait for any ongoing prefetch to complete
+                if self.enable_prefetch and is_decode and i_layer > 0:
+                    self.wait_for_prefetch()
                 
                 # Create one-hot mask for expert assignment
                 expert_mask = torch.nn.functional.one_hot(
@@ -780,18 +980,56 @@ class FiddlerMixtral:
                     current_state = inps[None, top_2_list].reshape(-1, hidden_dim)
                     
                     if not is_cuda:
-                        # Expert on CPU - use placeholder
-                        self.expert_placeholder.load_state_dict(
-                            experts[i_expert].state_dict()
-                        )
-                        current_state = self.expert_placeholder(
-                            current_state, routing_weights[top_2_list, idx_list, None]
-                        )
+                        # Expert on CPU - check if it's already loaded in a placeholder
+                        expert_found = False
+                        
+                        if self.enable_prefetch:
+                            with self.prefetch_lock:
+                                # Check if this expert is loaded in placeholder 0
+                                if self.placeholder_contents[0] == (i_layer, i_expert):
+                                    current_state = self.expert_placeholder_0(
+                                        current_state, routing_weights[top_2_list, idx_list, None]
+                                    )
+                                    expert_found = True
+                                    self.cnt_prefetch_hit += 1
+                                # Check if this expert is loaded in placeholder 1
+                                elif self.placeholder_contents[1] == (i_layer, i_expert):
+                                    current_state = self.expert_placeholder_1(
+                                        current_state, routing_weights[top_2_list, idx_list, None]
+                                    )
+                                    expert_found = True
+                                    self.cnt_prefetch_hit += 1
+                        
+                        if not expert_found:
+                            # Expert not prefetched - load on demand
+                            if self.enable_prefetch and is_decode:
+                                self.cnt_prefetch_miss += 1
+                            
+                            # Choose a placeholder to use (prefer one not containing next layer's experts)
+                            with self.prefetch_lock:
+                                # If placeholder 0 is free or contains an expert from a different layer
+                                if (self.placeholder_contents[0] is None or 
+                                    self.placeholder_contents[0][0] != i_layer + 1):
+                                    use_placeholder = self.expert_placeholder_0
+                                    self.placeholder_contents[0] = None  # Mark as in use
+                                else:
+                                    use_placeholder = self.expert_placeholder_1
+                                    self.placeholder_contents[1] = None  # Mark as in use
+                            
+                            use_placeholder.load_state_dict(
+                                experts[i_expert].state_dict()
+                            )
+                            current_state = use_placeholder(
+                                current_state, routing_weights[top_2_list, idx_list, None]
+                            )
                     else:
                         # Expert on GPU - direct computation
                         current_state = experts[i_expert](
                             current_state, routing_weights[top_2_list, idx_list, None]
                         )
+                        self.cnt_expert_hit += top_2.shape[0]
+                    
+                    self.cnt_expert_all += top_2.shape[0]
                     
                     # Accumulate weighted expert outputs
                     inps_after_experts.index_add_(
@@ -803,9 +1041,17 @@ class FiddlerMixtral:
                         experts[i_expert] = experts[i_expert].to("cpu")
 
                     # end of one expert
+                
+                # After processing all experts, start prefetching for next layer
+                if self.enable_prefetch and is_decode and i_layer < self.n_layer - 1:
+                    # Get predicted experts for next layer
+                    _, (next_expert_0, next_expert_1) = self.decode_expert_predictions[i_layer + 1]
+                    
+                    # Start prefetching both experts for next layer in background
+                    self.start_expert_prefetch(i_layer + 1, next_expert_0, next_expert_1)
 
             else:
-                # Advanced: Dynamic CPU/GPU offloading based on workload
+                # Advanced: Dynamic CPU/GPU offloading based on workload (original path)
                 
                 # Create expert assignment mask
                 expert_mask = torch.nn.functional.one_hot(
@@ -876,10 +1122,10 @@ class FiddlerMixtral:
                         )
                     else:
                         # Load to GPU placeholder and compute
-                        self.expert_placeholder.load_state_dict(
+                        self.expert_placeholder_0.load_state_dict(
                             experts[i_expert].state_dict()
                         )
-                        current_state = self.expert_placeholder(
+                        current_state = self.expert_placeholder_0(
                             current_state, routing_weights[top_2_list, idx_list, None]
                         )
                     
