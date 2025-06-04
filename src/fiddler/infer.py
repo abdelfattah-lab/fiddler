@@ -35,6 +35,11 @@ if __name__ == "__main__":
         help="Number of tokens to generate.",
     )
     parser.add_argument("--beam-width", type=int, default=1, help="Beam search width.")
+    parser.add_argument(
+        "--enable-prefetch",
+        action="store_true",
+        help="Enable expert prefetching during decode phase.",
+    )
 
     args = parser.parse_args()
     model = FiddlerMixtral(args)

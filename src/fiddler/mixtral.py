@@ -45,6 +45,8 @@ import copy
 import threading
 import time
 import queue
+import json
+import os
 
 import numpy as np
 import torch
@@ -81,6 +83,7 @@ class FiddlerMixtral:
         prefetch_thread: Background thread for expert prefetching
         prefetch_queue: Queue for prefetch requests
         prefetch_lock: Lock to protect placeholder_contents access
+        prefetch_timers: Dictionary for profiling prefetching operations
     """
     
     def __init__(self, args):
@@ -135,7 +138,7 @@ class FiddlerMixtral:
         # Configuration
         self.cpu_offload = args.cpu_offload
         self.beam_width = args.beam_width
-        self.enable_prefetch = getattr(args, 'enable_prefetch', True)
+        self.enable_prefetch = getattr(args, 'enable_prefetch', False)
         self.n_layer = len(self.model.layers)
         self.n_expert = len(self.model.layers[0].block_sparse_moe.experts)
        
@@ -156,44 +159,62 @@ class FiddlerMixtral:
             self.prefetch_thread = None
             self.prefetch_ready = threading.Event()
             self.prefetch_lock = threading.Lock()  # Protect placeholder_contents
-            
-            # Hardcoded expert predictions for decode phase
-            # Format: [(layer_idx, (expert_0, expert_1)), ...]
-            # These would be predicted in a real system
-            self.decode_expert_predictions = [
-                (0, (2, 5)),   # Layer 0 will use experts 2 and 5
-                (1, (4, 7)),   # Layer 1 will use experts 4 and 7
-                (2, (1, 4)),   # Layer 2 will use experts 1 and 4
-                (3, (0, 7)),   # Layer 3 will use experts 0 and 7
-                (4, (3, 6)),   # Layer 4 will use experts 3 and 6
-                (5, (1, 4)),   # Layer 5 will use experts 1 and 4
-                (6, (0, 7)),   # Layer 6 will use experts 0 and 7
-                (7, (2, 5)),   # Layer 7 will use experts 2 and 5
-                (8, (3, 6)),   # Layer 8 will use experts 3 and 6
-                (9, (0, 5)),   # Layer 9 will use experts 0 and 5
-                (10, (3, 4)),  # Layer 10 will use experts 3 and 4
-                (11, (0, 2)),  # Layer 11 will use experts 0 and 2
-                (12, (1, 4)),  # Layer 12 will use experts 1 and 4
-                (13, (0, 1)),  # Layer 13 will use experts 0 and 1
-                (14, (2, 5)),  # Layer 14 will use experts 2 and 5
-                (15, (1, 5)),  # Layer 15 will use experts 1 and 5
-                (16, (1, 7)),  # Layer 16 will use experts 1 and 7
-                (17, (2, 7)),  # Layer 17 will use experts 2 and 7
-                (18, (0, 4)),  # Layer 18 will use experts 0 and 4
-                (19, (2, 5)),  # Layer 19 will use experts 2 and 5
-                (20, (1, 5)),  # Layer 20 will use experts 1 and 5
-                (21, (0, 1)),  # Layer 21 will use experts 0 and 1
-                (22, (1, 4)),  # Layer 22 will use experts 1 and 4
-                (23, (2, 4)),  # Layer 23 will use experts 2 and 4
-                (24, (0, 2)),  # Layer 24 will use experts 0 and 2
-                (25, (1, 3)),  # Layer 25 will use experts 1 and 3
-                (26, (0, 2)),  # Layer 26 will use experts 0 and 2
-                (27, (2, 5)),  # Layer 27 will use experts 2 and 5
-                (28, (0, 4)),  # Layer 28 will use experts 0 and 4
-                (29, (3, 7)),  # Layer 29 will use experts 3 and 7
-                (30, (2, 7)),  # Layer 30 will use experts 2 and 7
-                (31, (4, 5)),  # Layer 31 will use experts 4 and 5
-            ]
+
+            # Load or initialize expert predictions
+            expert_pred_file = "expert_predictions.json"
+            if os.path.exists(expert_pred_file):
+                print(f"Loading expert predictions from {expert_pred_file}")
+                with open(expert_pred_file, 'r') as f:
+                    loaded_predictions = json.load(f)
+                # Convert from JSON format back to tuple format
+                self.decode_expert_predictions = [
+                    (item[0], tuple(item[1])) for item in loaded_predictions
+                ]
+            else:
+                print("No expert predictions file found, using hardcoded predictions")
+                # Keep the original hardcoded predictions here
+                self.decode_expert_predictions = [
+                    (0, (2, 5)),   # Layer 0 will use experts 2 and 5
+                    (1, (4, 7)),   # Layer 1 will use experts 4 and 7
+                    (2, (1, 4)),   # Layer 2 will use experts 1 and 4
+                    (3, (0, 7)),   # Layer 3 will use experts 0 and 7
+                    (4, (3, 6)),   # Layer 4 will use experts 3 and 6
+                    (5, (1, 4)),   # Layer 5 will use experts 1 and 4
+                    (6, (0, 7)),   # Layer 6 will use experts 0 and 7
+                    (7, (2, 5)),   # Layer 7 will use experts 2 and 5
+                    (8, (3, 6)),   # Layer 8 will use experts 3 and 6
+                    (9, (0, 5)),   # Layer 9 will use experts 0 and 5
+                    (10, (3, 4)),  # Layer 10 will use experts 3 and 4
+                    (11, (0, 2)),  # Layer 11 will use experts 0 and 2
+                    (12, (1, 4)),  # Layer 12 will use experts 1 and 4
+                    (13, (0, 1)),  # Layer 13 will use experts 0 and 1
+                    (14, (2, 5)),  # Layer 14 will use experts 2 and 5
+                    (15, (1, 5)),  # Layer 15 will use experts 1 and 5
+                    (16, (1, 7)),  # Layer 16 will use experts 1 and 7
+                    (17, (2, 7)),  # Layer 17 will use experts 2 and 7
+                    (18, (0, 4)),  # Layer 18 will use experts 0 and 4
+                    (19, (2, 5)),  # Layer 19 will use experts 2 and 5
+                    (20, (1, 5)),  # Layer 20 will use experts 1 and 5
+                    (21, (0, 1)),  # Layer 21 will use experts 0 and 1
+                    (22, (1, 4)),  # Layer 22 will use experts 1 and 4
+                    (23, (2, 4)),  # Layer 23 will use experts 2 and 4
+                    (24, (0, 2)),  # Layer 24 will use experts 0 and 2
+                    (25, (1, 3)),  # Layer 25 will use experts 1 and 3
+                    (26, (0, 2)),  # Layer 26 will use experts 0 and 2
+                    (27, (2, 5)),  # Layer 27 will use experts 2 and 5
+                    (28, (0, 4)),  # Layer 28 will use experts 0 and 4
+                    (29, (3, 7)),  # Layer 29 will use experts 3 and 7
+                    (30, (2, 7)),  # Layer 30 will use experts 2 and 7
+                    (31, (4, 5)),  # Layer 31 will use experts 4 and 5
+                ]
+
+        # Add profiling timers
+        self.prefetch_timers = {
+            'load_state_dict': 0.0,
+            'expert_compute': 0.0,
+            'wait_time': 0.0,
+            'total_prefetch': 0.0
+        }
 
         # Step 1: Move all non-expert components to GPU
         self.bring_non_expert_to_gpu()
@@ -570,6 +591,7 @@ class FiddlerMixtral:
         # Reserve 5% as buffer, account for already allocated memory
         free_mem = total_mem * 0.95 - torch.cuda.memory_allocated(self.dev)  # TODO: magic number
         
+        return 0; # TODO: remove this
         # Each parameter uses 2 bytes (bfloat16)
         # Account for 2 expert placeholders if prefetching is enabled
         placeholder_mem = n_param * 2 * (2 if self.enable_prefetch else 1)
@@ -594,6 +616,7 @@ class FiddlerMixtral:
                     break
                 
                 i_layer, expert_0, expert_1 = request
+                prefetch_start = time.time()
                 
                 # Load both experts if they're on CPU
                 experts_to_load = []
@@ -608,16 +631,22 @@ class FiddlerMixtral:
                     if len(experts_to_load) >= 1:
                         # Load first expert into placeholder 0
                         expert = self.model.layers[i_layer].block_sparse_moe.experts[experts_to_load[0]]
+                        load_start = time.time()
                         with torch.cuda.stream(torch.cuda.Stream()):
                             self.expert_placeholder_0.load_state_dict(expert.state_dict())
+                        self.prefetch_timers['load_state_dict'] += time.time() - load_start
                         self.placeholder_contents[0] = (i_layer, experts_to_load[0])
                     
                     if len(experts_to_load) >= 2:
                         # Load second expert into placeholder 1
                         expert = self.model.layers[i_layer].block_sparse_moe.experts[experts_to_load[1]]
+                        load_start = time.time()
                         with torch.cuda.stream(torch.cuda.Stream()):
                             self.expert_placeholder_1.load_state_dict(expert.state_dict())
+                        self.prefetch_timers['load_state_dict'] += time.time() - load_start
                         self.placeholder_contents[1] = (i_layer, experts_to_load[1])
+                
+                self.prefetch_timers['total_prefetch'] += time.time() - prefetch_start
                 
                 # Signal that prefetching is complete
                 self.prefetch_ready.set()
@@ -656,7 +685,9 @@ class FiddlerMixtral:
         Wait for ongoing prefetch operation to complete.
         """
         if self.enable_prefetch and self.prefetch_thread and self.prefetch_thread.is_alive():
+            wait_start = time.time()
             self.prefetch_ready.wait(timeout=1.0)  # Wait up to 1 second
+            self.prefetch_timers['wait_time'] += time.time() - wait_start
             # Ensure all CUDA operations are complete
             torch.cuda.synchronize()
 
@@ -718,6 +749,12 @@ class FiddlerMixtral:
         self.cnt_prefetch_hit = 0
         self.cnt_prefetch_miss = 0
         
+        # Track actual expert usage during decode phase
+        self.actual_expert_usage = {}  # {layer_idx: [(expert_0, expert_1), ...]}
+        for i in range(self.n_layer):
+            self.actual_expert_usage[i] = []
+        self.tracking_decode_experts = False
+
         # Reset prefetching state
         if self.enable_prefetch:
             with self.prefetch_lock:
@@ -746,6 +783,9 @@ class FiddlerMixtral:
 
         for i_token in range(output_token):
             if self.beam_width == 1:
+                # Start tracking expert usage after prefill
+                if is_decode and self.enable_prefetch:
+                    self.tracking_decode_experts = True
                 # Greedy decoding - show progress
                 print(self.tokenizer.decode(input_ids[0]))
                 # TODO: streaming output for beam search
@@ -814,6 +854,29 @@ class FiddlerMixtral:
         if self.enable_prefetch and self.prefetch_thread:
             self.prefetch_queue.put(None)  # Signal shutdown
             self.prefetch_thread.join(timeout=2.0)
+
+        # Save actual expert usage if we tracked it
+        if self.enable_prefetch and self.tracking_decode_experts and len(self.actual_expert_usage[0]) > 0:
+            # Convert to the expected format and take the first usage pattern
+            # (assuming consistent expert selection across tokens in decode phase)
+            expert_predictions = []
+            for layer_idx in range(self.n_layer):
+                if len(self.actual_expert_usage[layer_idx]) > 0:
+                    # Take the first occurrence (or could do majority voting)
+                    experts = self.actual_expert_usage[layer_idx][0]
+                    expert_predictions.append([layer_idx, list(experts)])
+            
+            # Save to file
+            expert_pred_file = "expert_predictions.json"
+            with open(expert_pred_file, 'w') as f:
+                json.dump(expert_predictions, f, indent=2)
+            print(f"Saved actual expert usage patterns to {expert_pred_file}")
+            
+            # Update current predictions for immediate use
+            self.decode_expert_predictions = [
+                (item[0], tuple(item[1])) for item in expert_predictions
+            ]
+            self.tracking_decode_experts = False
         
         # Select best beam based on cumulative probability
         probs = probs.view(-1, self.beam_width)
@@ -827,6 +890,11 @@ class FiddlerMixtral:
         if self.enable_prefetch:
             prefetch_rate = self.cnt_prefetch_hit / (self.cnt_prefetch_hit + self.cnt_prefetch_miss) if (self.cnt_prefetch_hit + self.cnt_prefetch_miss) > 0 else 0
             print(f"Prefetch hit rate: {prefetch_rate:.2%} ({self.cnt_prefetch_hit}/{self.cnt_prefetch_hit + self.cnt_prefetch_miss})")
+            print("\nPrefetch Profiling:")
+            print(f"  Load state dict time: {self.prefetch_timers['load_state_dict']:.3f}s")
+            print(f"  Expert compute time: {self.prefetch_timers['expert_compute']:.3f}s")
+            print(f"  Wait time: {self.prefetch_timers['wait_time']:.3f}s")
+            print(f"  Total prefetch time: {self.prefetch_timers['total_prefetch']:.3f}s")
 
         return (
             prefill_time,
@@ -931,6 +999,16 @@ class FiddlerMixtral:
             # routing_weights.shape: (batch_size*seq_len, 2)
             # selected_experts.shape: (batch_size*seq_len, 2)
             
+            # Track actual expert usage during decode phase
+            if self.tracking_decode_experts and is_decode and input_ids.shape[0] == 1:
+                # For single token decode, track which experts are selected
+                # We only track the first beam (index 0) for simplicity
+                if selected_experts.shape[0] >= 1:
+                    expert_0 = selected_experts[0, 0].item()
+                    expert_1 = selected_experts[0, 1].item()
+                    # Store as tuple to match expected format
+                    self.actual_expert_usage[i_layer].append((expert_0, expert_1))
+
             # Normalize routing weights
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
 
