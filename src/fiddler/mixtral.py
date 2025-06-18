@@ -80,9 +80,7 @@ class FiddlerMixtral:
         latency_cpu: Estimated latency per token on CPU (ms)
         latency_gpu: Estimated latency for GPU transfer (ms)
         enable_prefetch: Whether to enable expert prefetching
-        prefetch_thread: Background thread for expert prefetching
-        prefetch_queue: Queue for prefetch requests
-        prefetch_lock: Lock to protect placeholder_contents access
+        prefetch_stream: CUDA stream for async expert transfers
         prefetch_timers: Dictionary for profiling prefetching operations
     """
     
@@ -155,10 +153,12 @@ class FiddlerMixtral:
 
         # Prefetching infrastructure
         if self.enable_prefetch:
-            self.prefetch_queue = queue.Queue()
-            self.prefetch_thread = None
-            self.prefetch_ready = threading.Event()
-            self.prefetch_lock = threading.Lock()  # Protect placeholder_contents
+            # Create dedicated CUDA stream for prefetching
+            self.prefetch_stream = torch.cuda.Stream()
+            # Track ongoing prefetch
+            self.prefetch_in_progress = False
+            self.prefetch_target_layer = None
+            self.prefetch_target_experts = None
 
             # Load or initialize expert predictions
             expert_pred_file = "expert_predictions.json"
@@ -597,69 +597,20 @@ class FiddlerMixtral:
         placeholder_mem = n_param * 2 * (2 if self.enable_prefetch else 1)
         return int((free_mem - placeholder_mem) // (n_param * 2))
 
-    def prefetch_expert_worker(self):
+    def copy_expert_params(self, source_expert, target_placeholder):
         """
-        Worker thread for asynchronous expert prefetching.
-        
-        This runs in the background and loads requested experts from CPU to GPU
-        into the placeholders while the main thread continues computation.
-        For decode phase with 1 token, we can load both needed experts.
-        
-        Note: The main thread always waits for prefetch completion before using
-        the experts, so it's safe to clear and reload placeholders here.
+        Efficiently copy parameters from source expert to target placeholder.
         """
-        while True:
-            try:
-                # Wait for prefetch request
-                request = self.prefetch_queue.get(timeout=1.0)
-                if request is None:  # Shutdown signal
-                    break
-                
-                i_layer, expert_0, expert_1 = request
-                prefetch_start = time.time()
-                
-                # Load both experts if they're on CPU
-                experts_to_load = []
-                
-                if not self.is_expert_in_gpu(i_layer, expert_0):
-                    experts_to_load.append(expert_0)
-                if not self.is_expert_in_gpu(i_layer, expert_1) and expert_1 != expert_0:
-                    experts_to_load.append(expert_1)
-                
-                # Load up to 2 experts into our 2 placeholders
-                with self.prefetch_lock:
-                    if len(experts_to_load) >= 1:
-                        # Load first expert into placeholder 0
-                        expert = self.model.layers[i_layer].block_sparse_moe.experts[experts_to_load[0]]
-                        load_start = time.time()
-                        with torch.cuda.stream(torch.cuda.Stream()):
-                            self.expert_placeholder_0.load_state_dict(expert.state_dict())
-                        self.prefetch_timers['load_state_dict'] += time.time() - load_start
-                        self.placeholder_contents[0] = (i_layer, experts_to_load[0])
-                    
-                    if len(experts_to_load) >= 2:
-                        # Load second expert into placeholder 1
-                        expert = self.model.layers[i_layer].block_sparse_moe.experts[experts_to_load[1]]
-                        load_start = time.time()
-                        with torch.cuda.stream(torch.cuda.Stream()):
-                            self.expert_placeholder_1.load_state_dict(expert.state_dict())
-                        self.prefetch_timers['load_state_dict'] += time.time() - load_start
-                        self.placeholder_contents[1] = (i_layer, experts_to_load[1])
-                
-                self.prefetch_timers['total_prefetch'] += time.time() - prefetch_start
-                
-                # Signal that prefetching is complete
-                self.prefetch_ready.set()
-                
-            except queue.Empty:
-                continue
-            except Exception as e:
-                print(f"Prefetch worker error: {e}")
-                break
+        with torch.no_grad():
+            # Pin memory for faster transfers (do this once during init)
+            for param_src, param_tgt in zip(source_expert.parameters(), target_placeholder.parameters()):
+                if not param_src.is_pinned:
+                    param_src.data = param_src.pin_memory()
+                param_tgt.copy_(param_src, non_blocking=True)
 
-    def start_expert_prefetch(self, i_layer, expert_0, expert_1):
+    def start_expert_prefetch_async(self, i_layer, expert_0, expert_1):
         """
-        Start prefetching experts for the next layer.
+        Start prefetching experts for the next layer using CUDA streams.
         
         Args:
             i_layer: Layer index to prefetch experts for
@@ -669,27 +620,70 @@ class FiddlerMixtral:
         if not self.enable_prefetch:
             return
         
-        # Clear previous ready state
-        self.prefetch_ready.clear()
+        # Record what we're prefetching
+        self.prefetch_in_progress = True
+        self.prefetch_target_layer = i_layer
+        self.prefetch_target_experts = (expert_0, expert_1)
         
-        # Clear placeholder contents for new prefetch
-        with self.prefetch_lock:
+        # Only measure the actual work, not the async enqueue time
+        experts_to_load = []
+        
+        # Check which experts need loading
+        if not self.is_expert_in_gpu(i_layer, expert_0):
+            experts_to_load.append((expert_0, self.expert_placeholder_0, 0))
+        else:
             self.placeholder_contents[0] = None
+        
+        if not self.is_expert_in_gpu(i_layer, expert_1) and expert_1 != expert_0:
+            experts_to_load.append((expert_1, self.expert_placeholder_1, 1))
+        else:
             self.placeholder_contents[1] = None
         
-        # Queue the prefetch request
-        self.prefetch_queue.put((i_layer, expert_0, expert_1))
+        if len(experts_to_load) == 0:
+            # Nothing to prefetch
+            self.prefetch_in_progress = False
+            return
+        
+        # Use the prefetch stream for async transfers
+        with torch.cuda.stream(self.prefetch_stream):
+            for expert_idx, placeholder, placeholder_idx in experts_to_load:
+                expert = self.model.layers[i_layer].block_sparse_moe.experts[expert_idx]
+                
+                # Record CUDA event before copy
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                
+                start_event.record(self.prefetch_stream)
+                self.copy_expert_params(expert, placeholder)
+                end_event.record(self.prefetch_stream)
+                
+                # Store events for later timing
+                if not hasattr(self, 'prefetch_events'):
+                    self.prefetch_events = []
+                self.prefetch_events.append((start_event, end_event))
+                
+                self.placeholder_contents[placeholder_idx] = (i_layer, expert_idx)
 
     def wait_for_prefetch(self):
         """
-        Wait for ongoing prefetch operation to complete.
+        Wait for ongoing prefetch operation to complete by synchronizing streams.
         """
-        if self.enable_prefetch and self.prefetch_thread and self.prefetch_thread.is_alive():
+        if self.enable_prefetch and self.prefetch_in_progress:
             wait_start = time.time()
-            self.prefetch_ready.wait(timeout=1.0)  # Wait up to 1 second
+            # Wait for prefetch stream to complete
+            self.prefetch_stream.synchronize()
             self.prefetch_timers['wait_time'] += time.time() - wait_start
-            # Ensure all CUDA operations are complete
-            torch.cuda.synchronize()
+            
+            # Now measure actual CUDA execution time
+            if hasattr(self, 'prefetch_events'):
+                for start_event, end_event in self.prefetch_events:
+                    # This gives actual GPU execution time in milliseconds
+                    gpu_time = start_event.elapsed_time(end_event) / 1000.0  # Convert to seconds
+                    self.prefetch_timers['load_state_dict'] += gpu_time
+                    self.prefetch_timers['total_prefetch'] += gpu_time
+                self.prefetch_events = []
+            
+            self.prefetch_in_progress = False
 
     def initial_beam_tensor(self, input_tensor):
         """
@@ -757,13 +751,8 @@ class FiddlerMixtral:
 
         # Reset prefetching state
         if self.enable_prefetch:
-            with self.prefetch_lock:
-                self.placeholder_contents[0] = None
-                self.placeholder_contents[1] = None
-            # Start prefetch worker thread if not already running
-            if self.prefetch_thread is None or not self.prefetch_thread.is_alive():
-                self.prefetch_thread = threading.Thread(target=self.prefetch_expert_worker, daemon=True)
-                self.prefetch_thread.start()
+            self.placeholder_contents = {0: None, 1: None}
+            self.prefetch_in_progress = False
         
         # Tokenize input
         input_ids, position_ids = self.tokenize(text)
@@ -849,11 +838,6 @@ class FiddlerMixtral:
             is_decode = True
             
         decode_time = time.time() - tick
-        
-        # Cleanup prefetch thread
-        if self.enable_prefetch and self.prefetch_thread:
-            self.prefetch_queue.put(None)  # Signal shutdown
-            self.prefetch_thread.join(timeout=2.0)
 
         # Save actual expert usage if we tracked it
         if self.enable_prefetch and self.tracking_decode_experts and len(self.actual_expert_usage[0]) > 0:
@@ -1062,21 +1046,20 @@ class FiddlerMixtral:
                         expert_found = False
                         
                         if self.enable_prefetch:
-                            with self.prefetch_lock:
-                                # Check if this expert is loaded in placeholder 0
-                                if self.placeholder_contents[0] == (i_layer, i_expert):
-                                    current_state = self.expert_placeholder_0(
-                                        current_state, routing_weights[top_2_list, idx_list, None]
-                                    )
-                                    expert_found = True
-                                    self.cnt_prefetch_hit += 1
-                                # Check if this expert is loaded in placeholder 1
-                                elif self.placeholder_contents[1] == (i_layer, i_expert):
-                                    current_state = self.expert_placeholder_1(
-                                        current_state, routing_weights[top_2_list, idx_list, None]
-                                    )
-                                    expert_found = True
-                                    self.cnt_prefetch_hit += 1
+                            # Check if this expert is loaded in placeholder 0
+                            if self.placeholder_contents[0] == (i_layer, i_expert):
+                                current_state = self.expert_placeholder_0(
+                                    current_state, routing_weights[top_2_list, idx_list, None]
+                                )
+                                expert_found = True
+                                self.cnt_prefetch_hit = 1
+                            # Check if this expert is loaded in placeholder 1
+                            elif self.placeholder_contents[1] == (i_layer, i_expert):
+                                current_state = self.expert_placeholder_1(
+                                    current_state, routing_weights[top_2_list, idx_list, None]
+                                )
+                                expert_found = True
+                                self.cnt_prefetch_hit += 1
                         
                         if not expert_found:
                             # Expert not prefetched - load on demand
@@ -1084,19 +1067,15 @@ class FiddlerMixtral:
                                 self.cnt_prefetch_miss += 1
                             
                             # Choose a placeholder to use (prefer one not containing next layer's experts)
-                            with self.prefetch_lock:
-                                # If placeholder 0 is free or contains an expert from a different layer
-                                if (self.placeholder_contents[0] is None or 
-                                    self.placeholder_contents[0][0] != i_layer + 1):
-                                    use_placeholder = self.expert_placeholder_0
-                                    self.placeholder_contents[0] = None  # Mark as in use
-                                else:
-                                    use_placeholder = self.expert_placeholder_1
-                                    self.placeholder_contents[1] = None  # Mark as in use
+                            # Simple round-robin between placeholders
+                            if self.placeholder_contents[0] == (i_layer, i_expert):
+                                use_placeholder = self.expert_placeholder_0
+                            else:
+                                use_placeholder = self.expert_placeholder_0
+                                self.placeholder_contents[0] = None
                             
-                            use_placeholder.load_state_dict(
-                                experts[i_expert].state_dict()
-                            )
+                            # Use direct parameter copy instead of state dict
+                            self.copy_expert_params(experts[i_expert], use_placeholder)
                             current_state = use_placeholder(
                                 current_state, routing_weights[top_2_list, idx_list, None]
                             )
@@ -1125,8 +1104,8 @@ class FiddlerMixtral:
                     # Get predicted experts for next layer
                     _, (next_expert_0, next_expert_1) = self.decode_expert_predictions[i_layer + 1]
                     
-                    # Start prefetching both experts for next layer in background
-                    self.start_expert_prefetch(i_layer + 1, next_expert_0, next_expert_1)
+                    # Start async prefetching both experts for next layer
+                    self.start_expert_prefetch_async(i_layer + 1, next_expert_0, next_expert_1)
 
             else:
                 # Advanced: Dynamic CPU/GPU offloading based on workload (original path)
