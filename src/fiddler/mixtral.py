@@ -82,6 +82,8 @@ class FiddlerMixtral:
         enable_prefetch: Whether to enable expert prefetching
         prefetch_stream: CUDA stream for async expert transfers
         prefetch_timers: Dictionary for profiling prefetching operations
+        efficient_copy: Whether to use efficient parameter copying
+        all_experts_on_gpu: Whether to force all experts to run on the GPU
     """
     
     def __init__(self, args):
@@ -236,6 +238,10 @@ class FiddlerMixtral:
 
         print(f"Model is ready. Prefetching enabled: {self.enable_prefetch}")
 
+        # Additional configuration
+        self.efficient_copy = getattr(args, 'efficient_copy', False)
+        self.all_experts_on_gpu = getattr(args, 'all_experts_on_gpu', False)
+
     def bring_non_expert_to_gpu(self):
         """
         Move all non-expert model components to GPU.
@@ -275,6 +281,7 @@ class FiddlerMixtral:
                             Format: List of (layer_idx, expert_idx) tuples
                             ordered by usage frequency
         """
+
         if popular_experts is None:
             # Pre-computed popularity ranking from profiling runs
             # Format: (layer_index, expert_index) ordered by frequency of use
@@ -601,12 +608,15 @@ class FiddlerMixtral:
         """
         Efficiently copy parameters from source expert to target placeholder.
         """
-        with torch.no_grad():
-            # Pin memory for faster transfers (do this once during init)
-            for param_src, param_tgt in zip(source_expert.parameters(), target_placeholder.parameters()):
-                if not param_src.is_pinned:
-                    param_src.data = param_src.pin_memory()
-                param_tgt.copy_(param_src, non_blocking=True)
+        if self.efficient_copy:
+            with torch.no_grad():
+                for param_src, param_tgt in zip(source_expert.parameters(), target_placeholder.parameters()):
+                    if not param_src.is_pinned:
+                        param_src.data = param_src.pin_memory()
+                    param_tgt.copy_(param_src, non_blocking=True)
+        else:
+            # Normal (non-optimized) copy: use state_dict
+            target_placeholder.load_state_dict(source_expert.state_dict())
 
     def start_expert_prefetch_async(self, i_layer, expert_0, expert_1):
         """
@@ -1161,7 +1171,7 @@ class FiddlerMixtral:
                 cpu_experts = []
                 gpu_experts = []
                 for i_expert in range(8):
-                    if (best_config >> i_expert) & 1:
+                    if not(self.all_experts_on_gpu) and (best_config >> i_expert) & 1:
                         cpu_experts.append(i_expert)
                     else:
                         gpu_experts.append(i_expert)

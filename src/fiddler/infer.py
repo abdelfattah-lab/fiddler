@@ -40,6 +40,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable expert prefetching during decode phase.",
     )
+    parser.add_argument(
+        "--efficient-copy",
+        action="store_true",
+        help="Use efficient parameter copy (default: True). If not set, use normal copy.",
+    )
+    parser.add_argument(
+        "--all-experts-on-gpu",
+        action="store_true",
+        help="Place all experts on GPU (default: False). If not set, use offloading logic.",
+    )
 
     args = parser.parse_args()
     model = FiddlerMixtral(args)
