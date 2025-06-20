@@ -83,7 +83,7 @@ class FiddlerMixtral:
         prefetch_stream: CUDA stream for async expert transfers
         prefetch_timers: Dictionary for profiling prefetching operations
         efficient_copy: Whether to use efficient parameter copying
-        all_experts_on_gpu: Whether to force all experts to run on the GPU
+        run_all_experts_on_gpu: Whether to force all experts to run on the GPU
     """
     
     def __init__(self, args):
@@ -139,6 +139,7 @@ class FiddlerMixtral:
         self.cpu_offload = args.cpu_offload
         self.beam_width = args.beam_width
         self.enable_prefetch = getattr(args, 'enable_prefetch', False)
+        self.no_preloading = getattr(args, 'no_preloading', False)
         self.n_layer = len(self.model.layers)
         self.n_expert = len(self.model.layers[0].block_sparse_moe.experts)
        
@@ -162,53 +163,41 @@ class FiddlerMixtral:
             self.prefetch_target_layer = None
             self.prefetch_target_experts = None
 
-            # Load or initialize expert predictions
-            expert_pred_file = "expert_predictions.json"
-            if os.path.exists(expert_pred_file):
-                print(f"Loading expert predictions from {expert_pred_file}")
-                with open(expert_pred_file, 'r') as f:
-                    loaded_predictions = json.load(f)
-                # Convert from JSON format back to tuple format
-                self.decode_expert_predictions = [
-                    (item[0], tuple(item[1])) for item in loaded_predictions
-                ]
-            else:
-                print("No expert predictions file found, using hardcoded predictions")
-                # Keep the original hardcoded predictions here
-                self.decode_expert_predictions = [
-                    (0, (2, 5)),   # Layer 0 will use experts 2 and 5
-                    (1, (4, 7)),   # Layer 1 will use experts 4 and 7
-                    (2, (1, 4)),   # Layer 2 will use experts 1 and 4
-                    (3, (0, 7)),   # Layer 3 will use experts 0 and 7
-                    (4, (3, 6)),   # Layer 4 will use experts 3 and 6
-                    (5, (1, 4)),   # Layer 5 will use experts 1 and 4
-                    (6, (0, 7)),   # Layer 6 will use experts 0 and 7
-                    (7, (2, 5)),   # Layer 7 will use experts 2 and 5
-                    (8, (3, 6)),   # Layer 8 will use experts 3 and 6
-                    (9, (0, 5)),   # Layer 9 will use experts 0 and 5
-                    (10, (3, 4)),  # Layer 10 will use experts 3 and 4
-                    (11, (0, 2)),  # Layer 11 will use experts 0 and 2
-                    (12, (1, 4)),  # Layer 12 will use experts 1 and 4
-                    (13, (0, 1)),  # Layer 13 will use experts 0 and 1
-                    (14, (2, 5)),  # Layer 14 will use experts 2 and 5
-                    (15, (1, 5)),  # Layer 15 will use experts 1 and 5
-                    (16, (1, 7)),  # Layer 16 will use experts 1 and 7
-                    (17, (2, 7)),  # Layer 17 will use experts 2 and 7
-                    (18, (0, 4)),  # Layer 18 will use experts 0 and 4
-                    (19, (2, 5)),  # Layer 19 will use experts 2 and 5
-                    (20, (1, 5)),  # Layer 20 will use experts 1 and 5
-                    (21, (0, 1)),  # Layer 21 will use experts 0 and 1
-                    (22, (1, 4)),  # Layer 22 will use experts 1 and 4
-                    (23, (2, 4)),  # Layer 23 will use experts 2 and 4
-                    (24, (0, 2)),  # Layer 24 will use experts 0 and 2
-                    (25, (1, 3)),  # Layer 25 will use experts 1 and 3
-                    (26, (0, 2)),  # Layer 26 will use experts 0 and 2
-                    (27, (2, 5)),  # Layer 27 will use experts 2 and 5
-                    (28, (0, 4)),  # Layer 28 will use experts 0 and 4
-                    (29, (3, 7)),  # Layer 29 will use experts 3 and 7
-                    (30, (2, 7)),  # Layer 30 will use experts 2 and 7
-                    (31, (4, 5)),  # Layer 31 will use experts 4 and 5
-                ]
+
+            self.decode_expert_predictions = [
+                (0, (2, 5)),   # Layer 0 will use experts 2 and 5
+                (1, (4, 7)),   # Layer 1 will use experts 4 and 7
+                (2, (1, 4)),   # Layer 2 will use experts 1 and 4
+                (3, (0, 7)),   # Layer 3 will use experts 0 and 7
+                (4, (3, 6)),   # Layer 4 will use experts 3 and 6
+                (5, (1, 4)),   # Layer 5 will use experts 1 and 4
+                (6, (0, 7)),   # Layer 6 will use experts 0 and 7
+                (7, (2, 5)),   # Layer 7 will use experts 2 and 5
+                (8, (3, 6)),   # Layer 8 will use experts 3 and 6
+                (9, (0, 5)),   # Layer 9 will use experts 0 and 5
+                (10, (3, 4)),  # Layer 10 will use experts 3 and 4
+                (11, (0, 2)),  # Layer 11 will use experts 0 and 2
+                (12, (1, 4)),  # Layer 12 will use experts 1 and 4
+                (13, (0, 1)),  # Layer 13 will use experts 0 and 1
+                (14, (2, 5)),  # Layer 14 will use experts 2 and 5
+                (15, (1, 5)),  # Layer 15 will use experts 1 and 5
+                (16, (1, 7)),  # Layer 16 will use experts 1 and 7
+                (17, (2, 7)),  # Layer 17 will use experts 2 and 7
+                (18, (0, 4)),  # Layer 18 will use experts 0 and 4
+                (19, (2, 5)),  # Layer 19 will use experts 2 and 5
+                (20, (1, 5)),  # Layer 20 will use experts 1 and 5
+                (21, (0, 1)),  # Layer 21 will use experts 0 and 1
+                (22, (1, 4)),  # Layer 22 will use experts 1 and 4
+                (23, (2, 4)),  # Layer 23 will use experts 2 and 4
+                (24, (0, 2)),  # Layer 24 will use experts 0 and 2
+                (25, (1, 3)),  # Layer 25 will use experts 1 and 3
+                (26, (0, 2)),  # Layer 26 will use experts 0 and 2
+                (27, (2, 5)),  # Layer 27 will use experts 2 and 5
+                (28, (0, 4)),  # Layer 28 will use experts 0 and 4
+                (29, (3, 7)),  # Layer 29 will use experts 3 and 7
+                (30, (2, 7)),  # Layer 30 will use experts 2 and 7
+                (31, (4, 5)),  # Layer 31 will use experts 4 and 5
+            ]
 
         # Add profiling timers
         self.prefetch_timers = {
@@ -240,7 +229,7 @@ class FiddlerMixtral:
 
         # Additional configuration
         self.efficient_copy = getattr(args, 'efficient_copy', False)
-        self.all_experts_on_gpu = getattr(args, 'all_experts_on_gpu', False)
+        self.run_all_experts_on_gpu = getattr(args, 'run_all_experts_on_gpu', False)
 
     def bring_non_expert_to_gpu(self):
         """
@@ -598,7 +587,8 @@ class FiddlerMixtral:
         # Reserve 5% as buffer, account for already allocated memory
         free_mem = total_mem * 0.95 - torch.cuda.memory_allocated(self.dev)  # TODO: magic number
         
-        return 0; # TODO: remove this
+        if self.no_preloading:
+            return 0;
         # Each parameter uses 2 bytes (bfloat16)
         # Account for 2 expert placeholders if prefetching is enabled
         placeholder_mem = n_param * 2 * (2 if self.enable_prefetch else 1)
@@ -1033,7 +1023,11 @@ class FiddlerMixtral:
                     selected_experts, num_classes=8
                 ).permute(2, 1, 0)
 
+                # print the experts placed in placholder 0 and placeholder 1
+                # print(f'Placeholder 0: {self.placeholder_contents[0]}')
+                # print(f'Placeholder 1: {self.placeholder_contents[1]}')
                 # Process each expert
+                used_placeholder1 = False # TODO: To be removed
                 for i_expert in range(len(experts)):
                     is_cuda = self.is_expert_in_gpu(i_layer, i_expert)
                     
@@ -1042,7 +1036,10 @@ class FiddlerMixtral:
 
                     if top_2.shape[0] == 0:
                         # No tokens assigned to this expert
+                        # print(f'No tokens to expert {i_expert}.')
                         continue
+                    # else:
+                        # print(f'Found tokens for expert {i_expert}.')
 
                     # torch.cuda.synchronize()
                     top_2_list = top_2.tolist()
@@ -1057,14 +1054,17 @@ class FiddlerMixtral:
                         
                         if self.enable_prefetch:
                             # Check if this expert is loaded in placeholder 0
-                            if self.placeholder_contents[0] == (i_layer, i_expert):
+                            # if self.placeholder_contents[0] == (i_layer, i_expert):
+                            if not(used_placeholder1): # TODO: To be removed
+                                used_placeholder1 = True # TODO: To be removed
                                 current_state = self.expert_placeholder_0(
                                     current_state, routing_weights[top_2_list, idx_list, None]
                                 )
                                 expert_found = True
                                 self.cnt_prefetch_hit = 1
                             # Check if this expert is loaded in placeholder 1
-                            elif self.placeholder_contents[1] == (i_layer, i_expert):
+                            # elif self.placeholder_contents[1] == (i_layer, i_expert):
+                            else: # TODO: To be removed
                                 current_state = self.expert_placeholder_1(
                                     current_state, routing_weights[top_2_list, idx_list, None]
                                 )
@@ -1171,7 +1171,7 @@ class FiddlerMixtral:
                 cpu_experts = []
                 gpu_experts = []
                 for i_expert in range(8):
-                    if not(self.all_experts_on_gpu) and (best_config >> i_expert) & 1:
+                    if not(self.run_all_experts_on_gpu) and (best_config >> i_expert) & 1:
                         cpu_experts.append(i_expert)
                     else:
                         gpu_experts.append(i_expert)
