@@ -32,6 +32,10 @@ class FiddlerMixtral:
         self.beam_width = args.beam_width
         self.n_layer = len(self.model.layers)
         self.n_expert = len(self.model.layers[0].block_sparse_moe.experts)
+        
+        # Store max_experts_gpu if provided for testing
+        if hasattr(args, 'max_experts_gpu'):
+            self.max_experts_gpu = args.max_experts_gpu
        
 
         # TODO: find this value based on device config
@@ -350,6 +354,10 @@ class FiddlerMixtral:
 
     def calc_n_expert_on_gpu(self):
         """Get the number of experts that we can put on GPU"""
+        # Check if max_experts_gpu is specified (for testing purposes)
+        if hasattr(self, 'max_experts_gpu') and self.max_experts_gpu:
+            return min(self.max_experts_gpu, self.n_layer * self.n_expert)
+        
         # get the number of parameters of one expert
         n_param = sum(
             p.numel()
@@ -372,13 +380,15 @@ class FiddlerMixtral:
 
     def generate(self, text=None, output_token=20, input_token=None):
         torch.set_num_threads(16) # TODO: set appropriately
-        self.past_key_value = transformers.cache_utils.DynamicCache.from_legacy_cache()
-        self.past_key_values_length = 0
-
+        
         self.cnt_expert_hit = 0
         self.cnt_expert_all = 0
         
         input_ids, position_ids = self.tokenize(text)
+        
+        # FIXED: Initialize cache AFTER tokenization so we know the batch size
+        self.past_key_value = transformers.cache_utils.DynamicCache.from_legacy_cache()
+        self.past_key_values_length = 0
 
         if input_token is not None:
             input_ids = input_ids[:, :input_token]
@@ -456,11 +466,24 @@ class FiddlerMixtral:
         )
 
     def tokenize(self, text):
-        input_ids = []
-        encodings = self.tokenizer(text, return_tensors="pt")
-        input_id = encodings.input_ids.to(self.dev)
-        for i in range(self.beam_width):
-            input_ids.append(input_id[0])
+        # Handle both single text and batch of texts
+        if isinstance(text, list):
+            # Batch processing: multiple texts
+            input_ids = []
+            encodings = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+            input_ids_batch = encodings.input_ids.to(self.dev)
+            
+            # For each text in the batch, replicate for beam width
+            for i in range(input_ids_batch.shape[0]):  # For each text in batch
+                for j in range(self.beam_width):  # For each beam
+                    input_ids.append(input_ids_batch[i])
+        else:
+            # Single text processing (original behavior)
+            input_ids = []
+            encodings = self.tokenizer(text, return_tensors="pt")
+            input_id = encodings.input_ids.to(self.dev)
+            for i in range(self.beam_width):
+                input_ids.append(input_id[0])
         
         input_ids = pad_sequence(
             input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
@@ -469,7 +492,7 @@ class FiddlerMixtral:
         position_ids = torch.arange(
             0, input_ids.shape[-1], dtype=torch.long, device=self.dev
         )
-        position_ids = position_ids.unsqueeze(0).view(-1, input_ids.shape[-1])
+        position_ids = position_ids.unsqueeze(0).expand(input_ids.shape[0], -1)
 
         return input_ids, position_ids
 
