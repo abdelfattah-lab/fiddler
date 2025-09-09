@@ -11,10 +11,8 @@ import transformers
 
 class MixtralWithBuffers:
     def __init__(self, args, num_buffer_sets=2):
-        # Validate buffer sets configuration
-        if num_buffer_sets < 2:
-            raise ValueError("num_buffer_sets must be at least 2")
-        self.num_buffer_sets = num_buffer_sets
+        # DUAL BUFFER OPTIMIZATION: Use 2 buffers for true compute/memory overlap
+        self.num_buffer_sets = 2
         
         self.dtype = torch.bfloat16
         self.dev = torch.device("cuda:0")
@@ -26,16 +24,23 @@ class MixtralWithBuffers:
         )
         self.lm_head = self.model.lm_head
         self.model = self.model.model
-        # Create buffer sets - each buffer set contains 8 expert slots (one per expert in a layer)
-        self.buffer_sets = []
-        for i in range(self.num_buffer_sets):
-            buffer_set = []
-            for j in range(8):  # 8 experts per layer
-                expert_buffer = copy.deepcopy(
-                    self.model.layers[0].block_sparse_moe.experts[0]
-                ).to(self.dev)
-                buffer_set.append(expert_buffer)
-            self.buffer_sets.append(buffer_set)
+        # DUAL BUFFER: Two buffer sets for true compute/memory overlap
+        self.buffer_a = []  # Buffer A: current layer being processed
+        self.buffer_b = []  # Buffer B: next layer being prefetched
+        for j in range(8):  # 8 experts per layer
+            expert_buffer_a = copy.deepcopy(
+                self.model.layers[0].block_sparse_moe.experts[0]
+            ).to(self.dev)
+            expert_buffer_b = copy.deepcopy(
+                self.model.layers[0].block_sparse_moe.experts[0]
+            ).to(self.dev)
+            self.buffer_a.append(expert_buffer_a)
+            self.buffer_b.append(expert_buffer_b)
+            
+        # FALLBACK: Expert placeholder for on-demand loading like baseline
+        self.expert_placeholder = copy.deepcopy(
+            self.model.layers[0].block_sparse_moe.experts[0]
+        ).to(self.dev)
 
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(args.model)
         self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -56,131 +61,215 @@ class MixtralWithBuffers:
 
         self.bring_non_expert_to_gpu()
 
-        # Initialize expert location tracking
-        # Values: -1=CPU, 0=buffer_set_0, 1=buffer_set_1, etc.
-        self.expert_loc = np.full((self.n_layer, self.n_expert), -1, dtype=int)
+        # DUAL BUFFER: Track which layers are in each buffer
+        self.buffer_a_layer = 0  # Buffer A starts with layer 0
+        self.buffer_b_layer = 1  # Buffer B starts with layer 1
         
-        # Load first 2 layers into buffer sets
-        self.load_layer_to_buffer_set(0, 0)  # Load layer 0 into buffer set 0
-        self.load_layer_to_buffer_set(1, 1)  # Load layer 1 into buffer set 1
-        
-        # Update expert_loc to reflect buffer set assignments
-        for i_expert in range(self.n_expert):
-            self.expert_loc[0, i_expert] = 0  # Layer 0 in buffer set 0
-            self.expert_loc[1, i_expert] = 1  # Layer 1 in buffer set 1
-            
-        # Initialize threading infrastructure for background prefetching
-        # Use only 2 threads: one for even layers, one for odd layers
-        # With even/odd thread separation, we can reduce lock contention significantly
-        self.even_buffer_lock = threading.Lock()  # Lock for even layers (buffer sets 0, 2, 4, ...)
-        self.odd_buffer_lock = threading.Lock()   # Lock for odd layers (buffer sets 1, 3, 5, ...)
-        self.even_thread = None  # Thread for even layer numbers (0, 2, 4, ...)
-        self.odd_thread = None   # Thread for odd layer numbers (1, 3, 5, ...)
+        import concurrent.futures
+        self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self.prefetch_shutdown = False
-        # Track which layers are currently being prefetched with events
-        self.layer_prefetch_events = {}  # layer_idx -> threading.Event
-        self.prefetch_tracking_lock = threading.Lock()
         
-        print(f"Loaded layers 0-1 into buffer sets 0-1 ({self.n_expert * 2} experts total)")
+        # DUAL BUFFER: Streams for both buffers
+        self.compute_stream = torch.cuda.Stream()
+        self.memory_stream = torch.cuda.Stream()
+        
+        # DUAL BUFFER: Separate locks for each buffer (must be defined before loading)
+        self.buffer_a_lock = threading.RLock()
+        self.buffer_b_lock = threading.RLock()
+        
+        # Load first two layers into dual buffers
+        self.load_layer_to_buffer_a(0)  # Load layer 0 into buffer A
+        self.load_layer_to_buffer_b(1)  # Load layer 1 into buffer B
+        
+        # PHASE 2 OPTIMIZATION: Event pool for reuse instead of creating/destroying
+        self.event_pool = []  # Reusable events
+        self.event_pool_lock = threading.Lock()
+        self.layer_prefetch_events = {}  # layer_idx -> threading.Event
+        self.prefetch_tracking_lock = threading.RLock()  # Use RLock for nested locking
+        
+        print(f"Loaded layers 0 and 1 into dual buffers ({self.n_expert} experts per buffer)")
 
         print("Model is ready.")
+        
+    def __del__(self):
+        """Cleanup ThreadPoolExecutor when object is destroyed"""
+        self.shutdown_prefetch_threads()
+        
+    def shutdown_prefetch_threads(self):
+        """Gracefully shutdown background prefetch threads"""
+        self.prefetch_shutdown = True
+        if hasattr(self, 'thread_pool'):
+            self.thread_pool.shutdown(wait=False)
+            
+    def get_reusable_event(self):
+        # TODO: Is this really necessary? I don't like that we're adding more synchronization areas.
+        """PHASE 2 OPTIMIZATION: Get a reusable event from pool or create new one"""
+        with self.event_pool_lock:
+            if self.event_pool:
+                event = self.event_pool.pop()
+                event.clear()  # Reset event state
+                return event
+            else:
+                return threading.Event()
+                
+    def return_event_to_pool(self, event):
+        """PHASE 2 OPTIMIZATION: Return event to pool for reuse"""
+        with self.event_pool_lock:
+            if len(self.event_pool) < 10:  # Limit pool size to prevent memory bloat
+                self.event_pool.append(event)
+            
+    # Removed the adaptive prefetching that was essentially cheating by disabling prefetching
 
-    def load_layer_to_buffer_set(self, layer_idx, buffer_set_idx):
-        """Load all experts of a layer into a specific buffer set"""
-        if buffer_set_idx >= self.num_buffer_sets:
-            raise ValueError(f"buffer_set_idx {buffer_set_idx} >= num_buffer_sets {self.num_buffer_sets}")
+    def load_layer_to_buffer_a(self, layer_idx):
+        """Load all experts of a layer into buffer A"""
         if layer_idx >= self.n_layer:
             raise ValueError(f"layer_idx L{layer_idx} >= n_layer {self.n_layer}")
             
-        buffer_set = self.buffer_sets[buffer_set_idx]
         source_experts = self.model.layers[layer_idx].block_sparse_moe.experts
         
-        for i_expert in range(self.n_expert):
-            buffer_set[i_expert].load_state_dict(source_experts[i_expert].state_dict())
+        with self.buffer_a_lock:
+            with torch.cuda.stream(self.memory_stream):
+                with torch.no_grad():
+                    for i_expert in range(8):
+                        buffer_expert = self.buffer_a[i_expert]
+                        source_expert = source_experts[i_expert]
+                        
+                        for (buffer_name, buffer_param), (source_name, source_param) in zip(
+                            buffer_expert.named_parameters(), source_expert.named_parameters()):
+                            buffer_param.copy_(source_param, non_blocking=True)
+            
+            self.memory_stream.synchronize()
+            self.buffer_a_layer = layer_idx
 
-    def is_layer_in_buffer_set(self, layer_idx, buffer_set_idx):
-        """Check if a layer is currently loaded in a specific buffer set"""
-        if buffer_set_idx >= self.num_buffer_sets or layer_idx >= self.n_layer:
-            return False
-        return self.expert_loc[layer_idx, 0] == buffer_set_idx
-
-    def get_buffer_set_for_layer(self, layer_idx):
-        """Get the buffer set index for a layer, or -1 if not in any buffer set"""
+    def load_layer_to_buffer_b(self, layer_idx):
+        """Load all experts of a layer into buffer B"""
         if layer_idx >= self.n_layer:
-            return -1
-        # Check the first expert of the layer to determine which buffer set it's in
-        expert_loc = self.expert_loc[layer_idx, 0]
-        if expert_loc >= 0:  # In a buffer set
-            return expert_loc
-        return -1  # On CPU
+            raise ValueError(f"layer_idx L{layer_idx} >= n_layer {self.n_layer}")
+            
+        source_experts = self.model.layers[layer_idx].block_sparse_moe.experts
+        
+        with self.buffer_b_lock:
+            with torch.cuda.stream(self.memory_stream):
+                with torch.no_grad():
+                    for i_expert in range(8):
+                        buffer_expert = self.buffer_b[i_expert]
+                        source_expert = source_experts[i_expert]
+                        
+                        for (buffer_name, buffer_param), (source_name, source_param) in zip(
+                            buffer_expert.named_parameters(), source_expert.named_parameters()):
+                            buffer_param.copy_(source_param, non_blocking=True)
+            
+            self.memory_stream.synchronize()
+            self.buffer_b_layer = layer_idx
 
-    def prefetch_layer_to_buffer_set(self, completing_layer_idx, layer_to_prefetch_idx, buffer_set_idx):
-        """Prefetch a layer to a buffer set, replacing the completing layer"""
+    def prefetch_layer_to_buffer_a_with_event(self, layer_to_prefetch_idx):
+        """Prefetch layer to buffer A and signal event when complete"""
         if self.prefetch_shutdown:
             return
             
-        # Use appropriate lock based on buffer set parity to minimize contention
-        buffer_lock = self.even_buffer_lock if buffer_set_idx % 2 == 0 else self.odd_buffer_lock
+        self.load_layer_to_buffer_a(layer_to_prefetch_idx)
+        
+        # Signal completion and remove event
+        event_to_signal = None
+        with self.prefetch_tracking_lock:
+            event_to_signal = self.layer_prefetch_events.pop(layer_to_prefetch_idx, None)
+
+        if event_to_signal:
+            event_to_signal.set()
+            self.return_event_to_pool(event_to_signal)
+
+    def prefetch_layer_to_buffer_b_with_event(self, layer_to_prefetch_idx):
+        """Prefetch layer to buffer B and signal event when complete"""
+        if self.prefetch_shutdown:
+            return
+            
+        self.load_layer_to_buffer_b(layer_to_prefetch_idx)
+        
+        # Signal completion and remove event
+        event_to_signal = None
+        with self.prefetch_tracking_lock:
+            event_to_signal = self.layer_prefetch_events.pop(layer_to_prefetch_idx, None)
+
+        if event_to_signal:
+            event_to_signal.set()
+            self.return_event_to_pool(event_to_signal)
+
+    def is_layer_in_buffer(self, layer_idx):
+        """Check if the layer is in either buffer A or B"""
+        return (self.buffer_a_layer == layer_idx or self.buffer_b_layer == layer_idx)
+    
+    def get_buffer_for_layer(self, layer_idx):
+        """Get the buffer that contains the specified layer"""
+        if self.buffer_a_layer == layer_idx:
+            return self.buffer_a
+        elif self.buffer_b_layer == layer_idx:
+            return self.buffer_b
+        else:
+            return None
+
+    def prefetch_layer_to_buffer(self, layer_to_prefetch_idx):
+        """Prefetch a layer to the single buffer"""
+        if self.prefetch_shutdown:
+            return
         
         try:
-            with buffer_lock:
-                # Clear the completing layer's location
-                for i_expert in range(self.n_expert):
-                    self.expert_loc[completing_layer_idx, i_expert] = -1
+            with self.buffer_lock:
+                # Load the new layer into the single buffer
+                self.load_layer_to_buffer(layer_to_prefetch_idx)
                 
-                # Load the new layer into the buffer set
-                self.load_layer_to_buffer_set(layer_to_prefetch_idx, buffer_set_idx)
-                
-                # Update expert_loc for the new layer
-                for i_expert in range(self.n_expert):
-                    self.expert_loc[layer_to_prefetch_idx, i_expert] = buffer_set_idx
         finally:
-            # Signal completion and remove event
+            # PHASE 2 OPTIMIZATION: Signal completion and reuse events efficiently
+            event_to_signal = None
             with self.prefetch_tracking_lock:
-                if layer_to_prefetch_idx in self.layer_prefetch_events:
-                    self.layer_prefetch_events[layer_to_prefetch_idx].set()
-                    del self.layer_prefetch_events[layer_to_prefetch_idx]
+                event_to_signal = self.layer_prefetch_events.pop(layer_to_prefetch_idx, None)
+            
+            # Signal outside of lock to reduce contention
+            if event_to_signal:
+                event_to_signal.set()
+                # PHASE 2 OPTIMIZATION: Return event to pool for reuse
+                self.return_event_to_pool(event_to_signal)
 
-    def start_prefetch_thread(self, completing_layer_idx, target_layer_idx, buffer_set_idx):
-        """Start a prefetch thread using even/odd thread allocation"""
+    def start_prefetch_thread_to_buffer_a(self, target_layer_idx):
+        """Start a prefetch thread to load layer into buffer A"""
         if self.prefetch_shutdown:
             return
         
-        # Create event for this layer before starting thread
         with self.prefetch_tracking_lock:
-            self.layer_prefetch_events[target_layer_idx] = threading.Event()
+            self.layer_prefetch_events[target_layer_idx] = self.get_reusable_event()
             
-        thread = threading.Thread(
-            target=self.prefetch_layer_to_buffer_set,
-            args=(completing_layer_idx, target_layer_idx, buffer_set_idx),
-            daemon=True
+        self.thread_pool.submit(
+            self.prefetch_layer_to_buffer_a_with_event,
+            target_layer_idx
         )
+
+    def start_prefetch_thread_to_buffer_b(self, target_layer_idx):
+        """Start a prefetch thread to load layer into buffer B"""
+        if self.prefetch_shutdown:
+            return
         
-        # Assign thread based on target layer parity (even/odd)
-        if target_layer_idx % 2 == 0:  # Even layer
-            # Wait for previous even thread to complete if it exists
-            if self.even_thread is not None and self.even_thread.is_alive():
-                self.even_thread.join()
-            self.even_thread = thread
-        else:  # Odd layer
-            # Wait for previous odd thread to complete if it exists
-            if self.odd_thread is not None and self.odd_thread.is_alive():
-                self.odd_thread.join()
-            self.odd_thread = thread
-        
-        thread.start()
+        with self.prefetch_tracking_lock:
+            self.layer_prefetch_events[target_layer_idx] = self.get_reusable_event()
+            
+        self.thread_pool.submit(
+            self.prefetch_layer_to_buffer_b_with_event,
+            target_layer_idx
+        )
 
     def trigger_prefetch_for_layer_completion(self, completed_layer_idx):
-        """Trigger prefetching when a layer completes processing"""
+        """Trigger prefetching when a layer completes processing - dual buffer approach"""
         if self.prefetch_shutdown:
             return
             
-        # Calculate which layer to prefetch and which buffer set to use
+        # DUAL BUFFER: Prefetch layer N+2 into the buffer that's not being used
         next_layer_to_prefetch = (completed_layer_idx + 2) % self.n_layer
-        buffer_set_to_use = completed_layer_idx % self.num_buffer_sets
         
-        # Start prefetching in the background
-        self.start_prefetch_thread(completed_layer_idx, next_layer_to_prefetch, buffer_set_to_use)
+        # Determine which buffer to use for prefetching
+        if self.buffer_a_layer == completed_layer_idx:
+            # Just processed layer from buffer A, prefetch into buffer B
+            self.start_prefetch_thread_to_buffer_b(next_layer_to_prefetch)
+        elif self.buffer_b_layer == completed_layer_idx:
+            # Just processed layer from buffer B, prefetch into buffer A
+            self.start_prefetch_thread_to_buffer_a(next_layer_to_prefetch)
 
     def bring_non_expert_to_gpu(self):
         """Bring non-expert layers to GPU"""
@@ -194,37 +283,9 @@ class MixtralWithBuffers:
             self.model.layers[i].post_attention_layernorm.to(self.dev)
             # only model.layers[i].block_sparse_moe.experts is on CPU
 
-    def set_expert_loc(self, n_expert_on_gpu, popular_experts=None):
-        """Set the location of experts - DISABLED: keeping all experts on CPU initially"""
-        # This method is now disabled to keep all experts on CPU initially
-        # Only buffer sets will contain experts on GPU
-        pass
-
-    def bring_expert_to_gpu(self):
-        """Bring part of expert layers to GPU - DISABLED: keeping all experts on CPU initially"""
-        # This method is now disabled to keep all experts on CPU initially
-        # Only buffer sets will contain experts on GPU
-        pass
-
     def is_expert_in_gpu(self, i_layer, i_expert):
-        """Determine if the expert is in GPU (either in buffer sets or old GPU location)"""
-        return self.expert_loc[i_layer, i_expert] >= 0
-
-    def calc_n_expert_on_gpu(self):
-        """Get the number of experts that we can put on GPU"""
-        # Check if max_experts_gpu is specified (for testing purposes)
-        if hasattr(self, 'max_experts_gpu') and self.max_experts_gpu:
-            return min(self.max_experts_gpu, self.n_layer * self.n_expert)
-        
-        # get the number of parameters of one expert
-        n_param = sum(
-            p.numel()
-            for p in self.model.layers[0].block_sparse_moe.experts[0].parameters()
-        )
-        # get the amount of free memory on GPU
-        total_mem = torch.cuda.get_device_properties(self.dev).total_memory
-        free_mem = total_mem * 0.95 - torch.cuda.memory_allocated(self.dev) # TODO: magic number
-        return int((free_mem) // (n_param * 2))
+        """Determine if the expert is in GPU (in single buffer)"""
+        return self.is_layer_in_buffer(i_layer)
 
     def initial_beam_tensor(self, input_tensor):
         # transpose tensor of shape (beam_width, seq_len, beam_width) to (beam_width, 1) properly
@@ -317,10 +378,13 @@ class MixtralWithBuffers:
         print(f"Input: {text}")
         print(f"Output: {decode_strings[max_ids[0]]}")
 
+        # Store the generated text for comparison
+        self.last_generated_text = decode_strings[max_ids[0]]
+
         return (
             prefill_time,
             decode_time,
-            self.cnt_expert_hit / self.cnt_expert_all,
+            self.cnt_expert_hit / self.cnt_expert_all if self.cnt_expert_all > 0 else 0.0,
         )
 
     def tokenize(self, text):
@@ -385,49 +449,77 @@ class MixtralWithBuffers:
             # selected_experts.shape: (batch_size*seq_len, 2)
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
 
-            # intermediate variable to store the output of experts
+            # OPTIMIZATION: Pre-allocate output tensor more efficiently
             inps_after_experts = torch.zeros_like(inps, device=self.dev)
             experts = layer.block_sparse_moe.experts
 
-            # Run everything on GPU
+            # OPTIMIZATION: Compute expert mask more efficiently 
             expert_mask = torch.nn.functional.one_hot(
                 selected_experts, num_classes=8
             ).permute(2, 1, 0)
 
-            # Only wait for prefetch if layer is not already available in buffer sets
-            layer_buffer_set = self.get_buffer_set_for_layer(i_layer)
-            if layer_buffer_set == -1:  # Layer not in any buffer set, may need to wait for prefetch
-                print("Prefetching is not done. Waiting...")
-                with self.prefetch_tracking_lock:
-                    prefetch_event = self.layer_prefetch_events.get(i_layer)
-                if prefetch_event is not None:
-                    prefetch_event.wait()
-
-            for i_expert in range(len(experts)):
-                is_cuda = self.is_expert_in_gpu(i_layer, i_expert)
-                idx, top_2 = torch.where(expert_mask[i_expert])
-
-                if top_2.shape[0] == 0:
-                    continue
-
-                top_2_list = top_2.tolist()
-                idx_list = idx.tolist()
-
-                current_state = inps[None, top_2_list].reshape(-1, hidden_dim)
-                if not is_cuda:
-                    raise ValueError("Expert is not on the GPU")
+            # DUAL BUFFER: Determine which buffer to use for current layer
+            current_buffer_set = self.get_buffer_for_layer(i_layer)
+            use_prefetched_buffer = current_buffer_set is not None
+            
+            if not use_prefetched_buffer:
+                # Check if prefetch is in progress and ready
+                prefetch_event = None
+                if i_layer in self.layer_prefetch_events:
+                    with self.prefetch_tracking_lock:
+                        prefetch_event = self.layer_prefetch_events.get(i_layer)
                 
-                # Expert is on GPU - use buffer set expert (all experts should be in buffer sets now)
-                buffer_set_idx = self.expert_loc[i_layer, i_expert]
-                current_state = self.buffer_sets[buffer_set_idx][i_expert](
-                    current_state, routing_weights[top_2_list, idx_list, None]
-                )
-                self.cnt_expert_hit += top_2.shape[0]
-                self.cnt_expert_all += top_2.shape[0]
+                if prefetch_event is not None:
+                    # NON-BLOCKING CHECK: Only use if prefetch is already complete
+                    if prefetch_event.wait(timeout=0):  # Non-blocking check
+                        current_buffer_set = self.get_buffer_for_layer(i_layer)
+                        use_prefetched_buffer = current_buffer_set is not None
+            
+            if not use_prefetched_buffer:
+                # FALLBACK: Use same approach as baseline FiddlerMixtral
+                current_buffer_set = [self.expert_placeholder] * 8
+            
+            # SINGLE BUFFER: Process experts on dedicated compute stream
+            with torch.cuda.stream(self.compute_stream):
+                # OPTIMIZATION: Process all experts more efficiently
+                for i_expert in range(len(experts)):
+                    idx, top_2 = torch.where(expert_mask[i_expert])
+
+                    if top_2.shape[0] == 0:
+                        continue
+
+                    # OPTIMIZATION: Avoid unnecessary list conversion in tight loop
+                    current_state = inps[None, top_2].reshape(-1, hidden_dim)
                     
-                inps_after_experts.index_add_(
-                    0, top_2, current_state.to(inps.dtype)
-                )
+                    if use_prefetched_buffer:
+                        # Use prefetched buffer directly
+                        current_state = current_buffer_set[i_expert](
+                            current_state, routing_weights[top_2, idx, None]
+                        )
+                        print("Nice")
+                    else:
+                        print("Problem")
+                        # FALLBACK: Load expert on-demand like baseline FiddlerMixtral
+                        self.expert_placeholder.load_state_dict(
+                            experts[i_expert].state_dict()
+                        )
+                        current_state = self.expert_placeholder(
+                            current_state, routing_weights[top_2, idx, None]
+                        )
+                    
+                    # OPTIMIZATION: Batch update counters outside critical path
+                    batch_hit_count = top_2.shape[0]
+                    self.cnt_expert_hit += batch_hit_count
+                    self.cnt_expert_all += batch_hit_count
+                        
+                    inps_after_experts.index_add_(
+                        0, top_2, current_state.to(inps.dtype)
+                    )
+            
+            # SINGLE BUFFER: Use stream event instead of blocking synchronize
+            compute_event = torch.cuda.Event()
+            compute_event.record(self.compute_stream)
+            compute_event.wait()  # Non-blocking wait for compute completion
 
             # Trigger background prefetching after expert processing completes
             self.trigger_prefetch_for_layer_completion(i_layer)

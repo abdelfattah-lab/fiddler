@@ -354,6 +354,7 @@ class FiddlerMixtral:
 
     def calc_n_expert_on_gpu(self):
         """Get the number of experts that we can put on GPU"""
+        return 0
         # Check if max_experts_gpu is specified (for testing purposes)
         if hasattr(self, 'max_experts_gpu') and self.max_experts_gpu:
             return min(self.max_experts_gpu, self.n_layer * self.n_expert)
@@ -459,10 +460,13 @@ class FiddlerMixtral:
         print(f"Input: {text}")
         print(f"Output: {decode_strings[max_ids[0]]}")
 
+        # Store the generated text for comparison
+        self.last_generated_text = decode_strings[max_ids[0]]
+
         return (
             prefill_time,
             decode_time,
-            self.cnt_expert_hit / self.cnt_expert_all,
+            self.cnt_expert_hit / self.cnt_expert_all if self.cnt_expert_all > 0 else 0.0,
         )
 
     def tokenize(self, text):
@@ -617,11 +621,12 @@ class FiddlerMixtral:
                 cpu_experts = []
                 gpu_experts = []
                 for i_expert in range(8):
-                    if (best_config >> i_expert) & 1:
+                    if False:
                         cpu_experts.append(i_expert)
                     else:
                         gpu_experts.append(i_expert)
 
+                # print("StartiSng Expert Processing")
                 for i_expert in gpu_experts:
                     top_2_list = top_2s[i_expert].tolist()
                     idx_list = idxs[i_expert].tolist()
@@ -631,9 +636,14 @@ class FiddlerMixtral:
                             current_state, routing_weights[top_2_list, idx_list, None]
                         )
                     else:
+                        # import time
+                        # start_time = time.time()
                         self.expert_placeholder.load_state_dict(
                             experts[i_expert].state_dict()
                         )
+                        # end_time = time.time()
+                        # elapsed_time = end_time - start_time
+                        # print(f'Expert {i_expert} loaded in {elapsed_time:.6f} seconds')
                         current_state = self.expert_placeholder(
                             current_state, routing_weights[top_2_list, idx_list, None]
                         )
