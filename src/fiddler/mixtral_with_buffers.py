@@ -1,4 +1,5 @@
 import copy
+import random
 import threading
 import time
 
@@ -10,9 +11,12 @@ import transformers
 
 
 class MixtralWithBuffers:
-    def __init__(self, args, num_buffer_sets=2):
+    def __init__(self, args, num_buffer_sets=2, prefetch_percentage=100):
         # DUAL BUFFER OPTIMIZATION: Use 2 buffers for true compute/memory overlap
         self.num_buffer_sets = 2
+        
+        # HYBRID PREFETCHING: Configurable percentage of layers to prefetch
+        self.prefetch_percentage = prefetch_percentage  # 0-100%
         
         self.dtype = torch.bfloat16
         self.dev = torch.device("cuda:0")
@@ -58,6 +62,20 @@ class MixtralWithBuffers:
 
         self.cnt_expert_hit = 0
         self.cnt_expert_all = 0
+
+        # INSTRUMENTATION: Track prefetch vs fallback behavior
+        self.prefetch_hits = 0
+        self.prefetch_waits = 0  
+        self.fallback_loads = 0
+        self.prefetch_wait_times = []
+        
+        # HYBRID PREFETCHING: Track prefetching decisions
+        self.prefetch_decisions = 0  # Total prefetch decisions made
+        self.prefetch_skipped = 0    # Prefetches skipped due to percentage
+        
+        # DEBUG: Track prefetch triggering
+        self.prefetch_triggers = []  # List of (completed_layer, target_layer, buffer) tuples
+        self.layer_access_log = []   # List of (layer, token, hit_type) tuples
 
         self.bring_non_expert_to_gpu()
 
@@ -194,6 +212,26 @@ class MixtralWithBuffers:
             event_to_signal.set()
             self.return_event_to_pool(event_to_signal)
 
+    def should_prefetch_layer(self, layer_idx):
+        """Decide whether to prefetch this layer based on percentage"""
+        self.prefetch_decisions += 1
+        
+        if self.prefetch_percentage == 0:
+            self.prefetch_skipped += 1
+            return False
+        elif self.prefetch_percentage == 100:
+            return True
+        else:
+            # Deterministic random decision: seed random generator with layer index
+            # This creates true switching between prefetching and not prefetching
+            # while maintaining deterministic behavior for consistent outputs
+            random.seed(layer_idx + 42)  # +42 for additional randomness
+            random_value = random.randint(1, 100)
+            should_prefetch = random_value <= self.prefetch_percentage
+            if not should_prefetch:
+                self.prefetch_skipped += 1
+            return should_prefetch
+
     def is_layer_in_buffer(self, layer_idx):
         """Check if the layer is in either buffer A or B"""
         return (self.buffer_a_layer == layer_idx or self.buffer_b_layer == layer_idx)
@@ -263,13 +301,22 @@ class MixtralWithBuffers:
         # DUAL BUFFER: Prefetch layer N+2 into the buffer that's not being used
         next_layer_to_prefetch = (completed_layer_idx + 2) % self.n_layer
         
+        # HYBRID PREFETCHING: Check if we should prefetch this layer
+        if not self.should_prefetch_layer(next_layer_to_prefetch):
+            return  # Skip prefetching for this layer
+        
         # Determine which buffer to use for prefetching
-        if self.buffer_a_layer == completed_layer_idx:
-            # Just processed layer from buffer A, prefetch into buffer B
-            self.start_prefetch_thread_to_buffer_b(next_layer_to_prefetch)
-        elif self.buffer_b_layer == completed_layer_idx:
-            # Just processed layer from buffer B, prefetch into buffer A
+        # FIX: Use consistent even/odd buffer assignment
+        # Even layers (0, 2, 4, ...) → Buffer A
+        # Odd layers (1, 3, 5, ...) → Buffer B
+        if next_layer_to_prefetch % 2 == 0:
+            # Prefetch even layer into buffer A
+            self.prefetch_triggers.append((completed_layer_idx, next_layer_to_prefetch, 'A'))
             self.start_prefetch_thread_to_buffer_a(next_layer_to_prefetch)
+        else:
+            # Prefetch odd layer into buffer B
+            self.prefetch_triggers.append((completed_layer_idx, next_layer_to_prefetch, 'B'))
+            self.start_prefetch_thread_to_buffer_b(next_layer_to_prefetch)
 
     def bring_non_expert_to_gpu(self):
         """Bring non-expert layers to GPU"""
@@ -457,12 +504,21 @@ class MixtralWithBuffers:
             expert_mask = torch.nn.functional.one_hot(
                 selected_experts, num_classes=8
             ).permute(2, 1, 0)
+            
+            # EXACT MATCH: Create top_2s list like in original FiddlerMixtral
+            top_2s = []
+            for i_expert in range(len(experts)):
+                _, top_2 = torch.where(expert_mask[i_expert])
+                top_2s.append(top_2)
 
             # DUAL BUFFER: Determine which buffer to use for current layer
             current_buffer_set = self.get_buffer_for_layer(i_layer)
             use_prefetched_buffer = current_buffer_set is not None
             
-            if not use_prefetched_buffer:
+            if use_prefetched_buffer:
+                self.prefetch_hits += 1
+                self.layer_access_log.append((i_layer, 'direct_hit'))
+            else:
                 # Check if prefetch is in progress and ready
                 prefetch_event = None
                 if i_layer in self.layer_prefetch_events:
@@ -470,14 +526,25 @@ class MixtralWithBuffers:
                         prefetch_event = self.layer_prefetch_events.get(i_layer)
                 
                 if prefetch_event is not None:
+                    # INSTRUMENTATION: Time the wait operation
+                    import time
+                    wait_start = time.time()
+                    
                     # NON-BLOCKING CHECK: Only use if prefetch is already complete
                     if prefetch_event.wait(timeout=0):  # Non-blocking check
+                        wait_time = time.time() - wait_start
+                        self.prefetch_wait_times.append(wait_time)
                         current_buffer_set = self.get_buffer_for_layer(i_layer)
                         use_prefetched_buffer = current_buffer_set is not None
+                        if use_prefetched_buffer:
+                            self.prefetch_waits += 1
+                            self.layer_access_log.append((i_layer, 'prefetch_wait'))
             
             if not use_prefetched_buffer:
                 # FALLBACK: Use same approach as baseline FiddlerMixtral
                 current_buffer_set = [self.expert_placeholder] * 8
+                self.fallback_loads += 1
+                self.layer_access_log.append((i_layer, 'fallback'))
             
             # SINGLE BUFFER: Process experts on dedicated compute stream
             with torch.cuda.stream(self.compute_stream):
@@ -488,23 +555,24 @@ class MixtralWithBuffers:
                     if top_2.shape[0] == 0:
                         continue
 
-                    # OPTIMIZATION: Avoid unnecessary list conversion in tight loop
-                    current_state = inps[None, top_2].reshape(-1, hidden_dim)
+                    # EXACT MATCH: Use same tensor operations as original FiddlerMixtral
+                    top_2_list = top_2.tolist()
+                    idx_list = idx.tolist()
+                    
+                    current_state = inps[None, top_2_list].reshape(-1, hidden_dim)
                     
                     if use_prefetched_buffer:
                         # Use prefetched buffer directly
                         current_state = current_buffer_set[i_expert](
-                            current_state, routing_weights[top_2, idx, None]
+                            current_state, routing_weights[top_2_list, idx_list, None]
                         )
-                        print("Nice")
                     else:
-                        print("Problem")
                         # FALLBACK: Load expert on-demand like baseline FiddlerMixtral
                         self.expert_placeholder.load_state_dict(
                             experts[i_expert].state_dict()
                         )
                         current_state = self.expert_placeholder(
-                            current_state, routing_weights[top_2, idx, None]
+                            current_state, routing_weights[top_2_list, idx_list, None]
                         )
                     
                     # OPTIMIZATION: Batch update counters outside critical path
@@ -513,7 +581,9 @@ class MixtralWithBuffers:
                     self.cnt_expert_all += batch_hit_count
                         
                     inps_after_experts.index_add_(
-                        0, top_2, current_state.to(inps.dtype)
+                        0, 
+                        top_2s[i_expert].to(self.dev, non_blocking=True),
+                        current_state.to(self.dev, non_blocking=True)
                     )
             
             # SINGLE BUFFER: Use stream event instead of blocking synchronize
@@ -534,4 +604,42 @@ class MixtralWithBuffers:
 
         self.present_key_value = present_key_value
         return lm_logis
+    
+    def print_prefetch_stats(self):
+        """Print detailed prefetch behavior statistics"""
+        total = self.prefetch_hits + self.prefetch_waits + self.fallback_loads
+        print(f"\n=== HYBRID PREFETCHING ANALYSIS (Prefetch: {self.prefetch_percentage}%) ===")
+        print(f"Direct buffer hits: {self.prefetch_hits}/{total} ({self.prefetch_hits/total*100:.1f}%)")  
+        print(f"Prefetch waits (succeeded): {self.prefetch_waits}/{total} ({self.prefetch_waits/total*100:.1f}%)")
+        print(f"Fallback loads: {self.fallback_loads}/{total} ({self.fallback_loads/total*100:.1f}%)")
+        if self.prefetch_wait_times:
+            avg_wait = sum(self.prefetch_wait_times) / len(self.prefetch_wait_times)
+            print(f"Average wait time: {avg_wait*1000:.3f}ms")
+        print(f"Total layer accesses: {total}")
+        
+        # HYBRID PREFETCHING: Show prefetch decision statistics
+        print(f"\n=== PREFETCH DECISION ANALYSIS ===")
+        print(f"Prefetch decisions made: {self.prefetch_decisions}")
+        print(f"Prefetches skipped: {self.prefetch_skipped}/{self.prefetch_decisions} ({self.prefetch_skipped/self.prefetch_decisions*100:.1f}%)")
+        print(f"Actual prefetch rate: {(self.prefetch_decisions - self.prefetch_skipped)/self.prefetch_decisions*100:.1f}%")
+        
+        # DEBUG: Print prefetch triggers
+        print(f"\n=== PREFETCH TRIGGERS DEBUG ===")
+        print(f"Total prefetch triggers: {len(self.prefetch_triggers)}")
+        if len(self.prefetch_triggers) > 0:
+            print("First 10 triggers: (completed_layer → target_layer, buffer)")
+            for i, (completed, target, buffer) in enumerate(self.prefetch_triggers[:10]):
+                print(f"  {i+1}: Layer {completed} → Layer {target} (Buffer {buffer})")
+        
+        # DEBUG: Analyze layer access patterns  
+        print(f"\n=== LAYER ACCESS PATTERNS ===")
+        hit_layers = [layer for layer, access_type in self.layer_access_log if access_type == 'direct_hit']
+        fallback_layers = [layer for layer, access_type in self.layer_access_log if access_type == 'fallback']
+        
+        if hit_layers:
+            print(f"Hit layers (first 20): {hit_layers[:20]}")
+        if fallback_layers:
+            print(f"Fallback layers (first 20): {fallback_layers[:20]}")
+            
+        print("="*40)
 
