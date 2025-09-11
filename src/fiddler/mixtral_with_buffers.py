@@ -245,28 +245,6 @@ class MixtralWithBuffers:
         else:
             return None
 
-    def prefetch_layer_to_buffer(self, layer_to_prefetch_idx):
-        """Prefetch a layer to the single buffer"""
-        if self.prefetch_shutdown:
-            return
-        
-        try:
-            with self.buffer_lock:
-                # Load the new layer into the single buffer
-                self.load_layer_to_buffer(layer_to_prefetch_idx)
-                
-        finally:
-            # PHASE 2 OPTIMIZATION: Signal completion and reuse events efficiently
-            event_to_signal = None
-            with self.prefetch_tracking_lock:
-                event_to_signal = self.layer_prefetch_events.pop(layer_to_prefetch_idx, None)
-            
-            # Signal outside of lock to reduce contention
-            if event_to_signal:
-                event_to_signal.set()
-                # PHASE 2 OPTIMIZATION: Return event to pool for reuse
-                self.return_event_to_pool(event_to_signal)
-
     def start_prefetch_thread_to_buffer_a(self, target_layer_idx):
         """Start a prefetch thread to load layer into buffer A"""
         if self.prefetch_shutdown:
@@ -474,39 +452,6 @@ class MixtralWithBuffers:
         for i_layer, layer in enumerate(self.model.layers):
             original_inps_shape = inps.shape
 
-            inps_residual = inps
-            inps = layer.input_layernorm(inps)
-            inps, self_attn_weights, present_key_value = layer.self_attn(
-                inps,
-                position_ids=position_ids,
-                past_key_value=self.past_key_value,
-                use_cache=True,
-            )
-            # inps.shape: (batch_size, seq_len/token_num, embed_dim)
-            inps = inps_residual + inps
-            inps_residual = inps
-            inps = layer.post_attention_layernorm(inps)
-            inps = inps.view(-1, hidden_dim)
-            # inps.shape: (batch_size*seq_len*embed_dim/hidden_dim, hidden_dim)
-            router_logits = layer.block_sparse_moe.gate(inps)
-            routing_weights = F.softmax(router_logits, dim=1)
-            # routing_weights.shape: (batch_size*seq_len, num_experts)
-            routing_weights, selected_experts = torch.topk(routing_weights, 2, dim=-1)
-            # routing_weights.shape: (batch_size*seq_len, 2)
-            # selected_experts.shape: (batch_size*seq_len, 2)
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-
-            # OPTIMIZATION: Pre-allocate output tensor more efficiently
-            inps_after_experts = torch.zeros_like(inps, device=self.dev)
-            experts = layer.block_sparse_moe.experts
-
-            # OPTIMIZATION: Compute expert mask more efficiently 
-            expert_mask = torch.nn.functional.one_hot(
-                selected_experts, num_classes=8
-            ).permute(2, 1, 0)
-            
-            # PERFORMANCE: Direct tensor processing - no need for top_2s list
-
             # DUAL BUFFER: Determine which buffer to use for current layer
             current_buffer_set = self.get_buffer_for_layer(i_layer)
             use_prefetched_buffer = current_buffer_set is not None
@@ -541,9 +486,42 @@ class MixtralWithBuffers:
                 current_buffer_set = [self.expert_placeholder] * 8
                 self.fallback_loads += 1
                 self.layer_access_log.append((i_layer, 'fallback'))
-            
-            # SINGLE BUFFER: Process experts on dedicated compute stream
+
+            # EXPANDED COMPUTE STREAM: Cover entire layer processing for true parallelism
             with torch.cuda.stream(self.compute_stream):
+                inps_residual = inps
+                inps = layer.input_layernorm(inps)
+                inps, self_attn_weights, present_key_value = layer.self_attn(
+                    inps,
+                    position_ids=position_ids,
+                    past_key_value=self.past_key_value,
+                    use_cache=True,
+                )
+                # inps.shape: (batch_size, seq_len/token_num, embed_dim)
+                inps = inps_residual + inps
+                inps_residual = inps
+                inps = layer.post_attention_layernorm(inps)
+                inps = inps.view(-1, hidden_dim)
+                # inps.shape: (batch_size*seq_len*embed_dim/hidden_dim, hidden_dim)
+                router_logits = layer.block_sparse_moe.gate(inps)
+                routing_weights = F.softmax(router_logits, dim=1)
+                # routing_weights.shape: (batch_size*seq_len, num_experts)
+                routing_weights, selected_experts = torch.topk(routing_weights, 2, dim=-1)
+                # routing_weights.shape: (batch_size*seq_len, 2)
+                # selected_experts.shape: (batch_size*seq_len, 2)
+                routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+
+                # OPTIMIZATION: Pre-allocate output tensor more efficiently
+                inps_after_experts = torch.zeros_like(inps, device=self.dev)
+                experts = layer.block_sparse_moe.experts
+
+                # OPTIMIZATION: Compute expert mask more efficiently 
+                expert_mask = torch.nn.functional.one_hot(
+                    selected_experts, num_classes=8
+                ).permute(2, 1, 0)
+                
+                # PERFORMANCE: Direct tensor processing - no need for top_2s list
+
                 # OPTIMIZATION: Process all experts more efficiently
                 for i_expert in range(len(experts)):
                     idx, top_2 = torch.where(expert_mask[i_expert])
@@ -578,17 +556,17 @@ class MixtralWithBuffers:
                     inps_after_experts.index_add_(
                         0, top_2, current_state.to(inps.dtype)
                     )
+
+                # addition because there's residual connection over moe layer
+                inps = inps_residual + inps_after_experts.reshape(original_inps_shape)
             
-            # SINGLE BUFFER: Use stream event instead of blocking synchronize
+            # EXPANDED COMPUTE STREAM: Use stream event for proper synchronization
             compute_event = torch.cuda.Event()
             compute_event.record(self.compute_stream)
             compute_event.wait()  # Non-blocking wait for compute completion
 
-            # Trigger background prefetching after expert processing completes
+            # Trigger background prefetching after entire layer processing completes
             self.trigger_prefetch_for_layer_completion(i_layer)
-
-            # addition because there's residual connection over moe layer
-            inps = inps_residual + inps_after_experts.reshape(original_inps_shape)
 
             # end of one layer
 
