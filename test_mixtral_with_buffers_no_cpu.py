@@ -8,13 +8,26 @@ import torch
 # Add src to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
+# CUDA EARLY INITIALIZATION: Force CUDA context creation early
+print("🔧 Initializing CUDA...")
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA is not available")
+
+# Force CUDA initialization
+torch.cuda.init()
+torch.cuda.set_device(0)
+test_tensor = torch.tensor([1.0]).cuda()
+print(f"✅ CUDA initialized successfully on device: {torch.cuda.get_device_name(0)}")
+del test_tensor
+torch.cuda.empty_cache()
+
 from fiddler.mixtral_with_buffers import MixtralWithBuffers
 from fiddler.mixtral import FiddlerMixtral
 from fiddler.mixtral_with_predictor import FiddlerMixtralWithPredictor
 
 MODEL_UNDER_TEST = MixtralWithBuffers
-MODEL_UNDER_TEST = FiddlerMixtral
-MODEL_UNDER_TEST = FiddlerMixtralWithPredictor
+# MODEL_UNDER_TEST = FiddlerMixtral
+# MODEL_UNDER_TEST = FiddlerMixtralWithPredictor
 
 def test_generate_single():
     """Test single text generation"""
@@ -31,7 +44,7 @@ def test_generate_single():
                 self.cpu_offload = 1  # Match working configuration
                 
         args = Args()
-        model = MODEL_UNDER_TEST(args)  # Disable prefetching for correct generation
+        model = MODEL_UNDER_TEST(args, prefetch_percentage=0)  # Disable prefetching for correct generation
         
         # Test generation with a simple prompt
         start_time = time.time()

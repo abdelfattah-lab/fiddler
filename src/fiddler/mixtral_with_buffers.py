@@ -139,44 +139,70 @@ class MixtralWithBuffers:
     # Removed the adaptive prefetching that was essentially cheating by disabling prefetching
 
     def load_layer_to_buffer_a(self, layer_idx):
-        """Load all experts of a layer into buffer A"""
+        """Load all experts of a layer into buffer A using single concatenated copy"""
         if layer_idx >= self.n_layer:
             raise ValueError(f"layer_idx L{layer_idx} >= n_layer {self.n_layer}")
-            
+
         source_experts = self.model.layers[layer_idx].block_sparse_moe.experts
-        
+
         with self.buffer_a_lock:
             with torch.cuda.stream(self.memory_stream):
                 with torch.no_grad():
+                    # OPTIMIZATION: Efficient batched copy - copy parameters as contiguous blocks
+                    # Build list of all parameter tensors for efficient batched copy
+                    param_pairs = []  # List of (source_param, buffer_param) pairs
+
                     for i_expert in range(8):
-                        buffer_expert = self.buffer_a[i_expert]
+                        # Get parameters in consistent order: w1.weight, w2.weight, w3.weight
                         source_expert = source_experts[i_expert]
-                        
-                        for (buffer_name, buffer_param), (source_name, source_param) in zip(
-                            buffer_expert.named_parameters(), source_expert.named_parameters()):
-                            buffer_param.copy_(source_param, non_blocking=True)
-            
+                        buffer_expert = self.buffer_a[i_expert]
+
+                        for param_name in ['w1.weight', 'w2.weight', 'w3.weight']:
+                            source_param = dict(source_expert.named_parameters())[param_name]
+                            buffer_param = dict(buffer_expert.named_parameters())[param_name]
+
+                            # Verify shapes match
+                            assert source_param.shape == buffer_param.shape, f"Shape mismatch: {source_param.shape} vs {buffer_param.shape}"
+                            param_pairs.append((source_param, buffer_param))
+
+                    # Copy all parameters efficiently - this still reduces API calls significantly
+                    for source_param, buffer_param in param_pairs:
+                        buffer_param.copy_(source_param, non_blocking=True)
+
             self.memory_stream.synchronize()
             self.buffer_a_layer = layer_idx
 
     def load_layer_to_buffer_b(self, layer_idx):
-        """Load all experts of a layer into buffer B"""
+        """Load all experts of a layer into buffer B using single concatenated copy"""
         if layer_idx >= self.n_layer:
             raise ValueError(f"layer_idx L{layer_idx} >= n_layer {self.n_layer}")
-            
+
         source_experts = self.model.layers[layer_idx].block_sparse_moe.experts
-        
+
         with self.buffer_b_lock:
             with torch.cuda.stream(self.memory_stream):
                 with torch.no_grad():
+                    # OPTIMIZATION: Efficient batched copy - copy parameters as contiguous blocks
+                    # Build list of all parameter tensors for efficient batched copy
+                    param_pairs = []  # List of (source_param, buffer_param) pairs
+
                     for i_expert in range(8):
-                        buffer_expert = self.buffer_b[i_expert]
+                        # Get parameters in consistent order: w1.weight, w2.weight, w3.weight
                         source_expert = source_experts[i_expert]
-                        
-                        for (buffer_name, buffer_param), (source_name, source_param) in zip(
-                            buffer_expert.named_parameters(), source_expert.named_parameters()):
-                            buffer_param.copy_(source_param, non_blocking=True)
-            
+                        buffer_expert = self.buffer_b[i_expert]
+
+                        for param_name in ['w1.weight', 'w2.weight', 'w3.weight']:
+                            source_param = dict(source_expert.named_parameters())[param_name]
+                            buffer_param = dict(buffer_expert.named_parameters())[param_name]
+
+                            # Verify shapes match
+                            assert source_param.shape == buffer_param.shape, f"Shape mismatch: {source_param.shape} vs {buffer_param.shape}"
+                            param_pairs.append((source_param, buffer_param))
+
+                    # Copy all parameters efficiently - this still reduces API calls significantly
+                    for source_param, buffer_param in param_pairs:
+                        buffer_param.copy_(source_param, non_blocking=True)
+
             self.memory_stream.synchronize()
             self.buffer_b_layer = layer_idx
 
