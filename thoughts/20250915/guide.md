@@ -5,17 +5,7 @@ This project optimizes Mixture of Experts (MoE) inference for Mixtral 8x7B model
 
 ## **Current Goal**
 
-Your immediate goal is to write a very detailed plan for implementing a new class that performs prefetching in the following manner:
-We will have 2 buffers, each holding 2 experts which are the correct experts needed for this layer processing. Buffer A will hold even layer experts and Buffer B will hold odd layer experts.
-
-**KEY REQUIREMENTS:**
-1. **Exact Expert Recording**: Record the EXACT experts used for each layer at each token position during the first run. Use efficient O(1) lookup structure: `{token_pos: {layer_id: [expert1, expert2]}}` - NO looping through layers to find experts.
-2. **Simple Status Tracking**: Use simple `buffer.is_ready` status checking instead of CUDA events. If prefetch isn't ready when needed, fall back to on-demand loading.
-3. **Deterministic Prefetching**: During decode, we know exactly which 2 experts are needed for each layer at each token position, enabling ~100% hit rate.
-
-To know the correct experts needed, we will run the test once and capture the actual experts used then save them in a file and later load that file to know which experts to bring when.
-Layers 0 and 1 will actually miss their experts because we won't know them in advance in the final scenario. After layer 0 finishes its expert processing part, we prefetch experts needed for layer 2 into the buffer asynchronously. When layer 1 finishes its expert processing part, we prefetch experts needed for layer 3 into the buffer asynchronously.
-We hope that by the time layer 2 is starting its expert processing part, its needed experts were already prefetched into buffer A. In that case, it can use them directly. If not, it will load them on demand. Let's keep track of the prefetch hit rate. For prefill, more than 2 experts will needed. We will just use the ones we have and the others fetch them on demand. Please make sure the implementation is as efficient as possible. The goal is to achieve a speedup.
+Your immediate goal is to implement the plan in thoughts/20250915/prefetch_implementation_plan.md and create a new md file showing the updated state of the project wherever you stop so that other agents can pick off where you left
 
 ## 🏗️ **CORE ARCHITECTURE**
 
