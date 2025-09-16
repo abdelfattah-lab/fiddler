@@ -354,9 +354,8 @@ class FiddlerMixtral:
 
     def calc_n_expert_on_gpu(self):
         """Get the number of experts that we can put on GPU"""
-        return 0
         # Check if max_experts_gpu is specified (for testing purposes)
-        if hasattr(self, 'max_experts_gpu') and self.max_experts_gpu:
+        if hasattr(self, 'max_experts_gpu'):
             return min(self.max_experts_gpu, self.n_layer * self.n_expert)
         
         # get the number of parameters of one expert
@@ -621,7 +620,7 @@ class FiddlerMixtral:
                 cpu_experts = []
                 gpu_experts = []
                 for i_expert in range(8):
-                    if False:
+                    if (best_config >> i_expert) & 1:
                         cpu_experts.append(i_expert)
                     else:
                         gpu_experts.append(i_expert)
