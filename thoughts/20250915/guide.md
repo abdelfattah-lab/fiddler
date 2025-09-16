@@ -5,7 +5,7 @@ This project optimizes Mixture of Experts (MoE) inference for Mixtral 8x7B model
 
 ## **Current Goal**
 
-Your immediate goal is to implement the plan in thoughts/20250915/prefetch_implementation_plan.md and create a new md file showing the updated state of the project wherever you stop so that other agents can pick off where you left
+Your immediate goal is to review thoughts/20250915/implementation_status_after_prefetch.md to profile (using Nvidia Nsight) the baseline and prefetch implementation and determine what opportunities does the prefetch implementation have to increase its speed and write down an md file explaining what to do to achieve better speedup.
 
 ## 🏗️ **CORE ARCHITECTURE**
 
