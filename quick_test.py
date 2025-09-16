@@ -24,11 +24,13 @@ torch.cuda.set_device(0)
 from fiddler.mixtral import FiddlerMixtral
 from fiddler.mixtral_with_buffers import MixtralWithBuffers
 from fiddler.mixtral_with_predictor import FiddlerMixtralWithPredictor
+from fiddler.mixtral_with_prefetch import FiddlerMixtralWithPrefetch
 
 MODELS = {
     'FiddlerMixtral': FiddlerMixtral,
     'MixtralWithBuffers': MixtralWithBuffers,
     'FiddlerMixtralWithPredictor': FiddlerMixtralWithPredictor,
+    'FiddlerMixtralWithPrefetch': FiddlerMixtralWithPrefetch,
 }
 
 def create_args():
