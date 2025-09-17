@@ -67,11 +67,15 @@ class ExpertUsageProfiler:
 
     def record_layer_experts(self, layer_id, selected_experts):
         """Record the exact 2 experts for this layer at current token position."""
-        if self.current_token_pos not in self.expert_patterns:
-            self.expert_patterns[self.current_token_pos] = {}
+        # Convert to string keys for JSON compatibility
+        token_key = str(self.current_token_pos)
+        layer_key = str(layer_id)
+
+        if token_key not in self.expert_patterns:
+            self.expert_patterns[token_key] = {}
 
         top_2_experts = selected_experts.flatten().tolist()[:2]  # Take exactly top-2
-        self.expert_patterns[self.current_token_pos][layer_id] = top_2_experts
+        self.expert_patterns[token_key][layer_key] = top_2_experts
 
     def advance_token_position(self):
         """Move to next token position (called after each complete forward pass)."""
@@ -79,8 +83,12 @@ class ExpertUsageProfiler:
 
     def get_experts_for_layer(self, layer_id, token_pos):
         """O(1) lookup: return exact experts needed for this layer at this token position."""
-        if token_pos in self.expert_patterns and layer_id in self.expert_patterns[token_pos]:
-            return self.expert_patterns[token_pos][layer_id]
+        # Convert to string keys for JSON compatibility
+        token_key = str(token_pos)
+        layer_key = str(layer_id)
+
+        if token_key in self.expert_patterns and layer_key in self.expert_patterns[token_key]:
+            return self.expert_patterns[token_key][layer_key]
         return None  # No recorded pattern available
 
 
@@ -93,14 +101,35 @@ class PrefetchMetrics:
         self.prefetch_misses = 0
         self.layer_metrics = {}  # per-layer hit rates
 
+        # Detailed tracking by phase
+        self.prefill_hits = 0
+        self.prefill_misses = 0
+        self.decode_hits = 0
+        self.decode_misses = 0
+
+        # Track current phase
+        self.current_phase = "prefill"
+
+    def set_phase(self, phase):
+        """Set current phase (prefill or decode)."""
+        self.current_phase = phase
+
     def record_expert_access(self, layer_id, expert_id, was_prefetched):
         """Record whether an expert access was a hit or miss."""
         self.total_expert_requests += 1
 
         if was_prefetched:
             self.prefetch_hits += 1
+            if self.current_phase == "prefill":
+                self.prefill_hits += 1
+            else:
+                self.decode_hits += 1
         else:
             self.prefetch_misses += 1
+            if self.current_phase == "prefill":
+                self.prefill_misses += 1
+            else:
+                self.decode_misses += 1
 
         # Track per-layer metrics
         if layer_id not in self.layer_metrics:
@@ -115,6 +144,33 @@ class PrefetchMetrics:
         if self.total_expert_requests == 0:
             return 0.0
         return self.prefetch_hits / self.total_expert_requests
+
+    def get_decode_hit_rate(self):
+        """Get decode-phase prefetch hit rate."""
+        total_decode = self.decode_hits + self.decode_misses
+        if total_decode == 0:
+            return 0.0
+        return self.decode_hits / total_decode
+
+    def get_stats_summary(self):
+        """Get comprehensive statistics summary."""
+        total_prefill = self.prefill_hits + self.prefill_misses
+        total_decode = self.decode_hits + self.decode_misses
+
+        return {
+            'overall_hit_rate': self.get_hit_rate(),
+            'decode_hit_rate': self.get_decode_hit_rate(),
+            'prefill_hit_rate': self.prefill_hits / total_prefill if total_prefill > 0 else 0.0,
+            'total_requests': self.total_expert_requests,
+            'prefill_requests': total_prefill,
+            'decode_requests': total_decode,
+            'prefetch_hits': self.prefetch_hits,
+            'prefetch_misses': self.prefetch_misses,
+            'prefill_hits': self.prefill_hits,
+            'prefill_misses': self.prefill_misses,
+            'decode_hits': self.decode_hits,
+            'decode_misses': self.decode_misses
+        }
 
 
 class FiddlerMixtralWithPrefetch(FiddlerMixtral):
@@ -184,16 +240,14 @@ class FiddlerMixtralWithPrefetch(FiddlerMixtral):
         )
         return self.expert_placeholder
 
-    def trigger_prefetch_for_layer(self, layer_id):
-        """Trigger asynchronous prefetch for the specified layer."""
+    def trigger_prefetch_for_layer(self, layer_id, token_pos):
+        """Trigger asynchronous prefetch for the specified layer at given token position."""
         if layer_id >= self.n_layer:
             return
 
         # Get expected experts for this layer from patterns
         if not self.collection_mode:
-            expected_experts = self.profiler.get_experts_for_layer(
-                layer_id, self.profiler.current_token_pos
-            )
+            expected_experts = self.profiler.get_experts_for_layer(layer_id, token_pos)
             if expected_experts:
                 target_buffer = self.get_buffer_for_layer(layer_id)
                 self.prefetcher.prefetch_experts_async(
@@ -266,9 +320,9 @@ class FiddlerMixtralWithPrefetch(FiddlerMixtral):
 
                 self.cnt_expert_all += top_2.shape[0]
 
-            # Trigger prefetch for future layers
+            # Trigger prefetch for next layers at current token position
             if i_layer + 2 < self.n_layer:
-                self.trigger_prefetch_for_layer(i_layer + 2)
+                self.trigger_prefetch_for_layer(i_layer + 2, self.profiler.current_token_pos)
 
             # addition because there's residual connection over moe layer
             inps = inps_residual + inps_after_experts.reshape(original_inps_shape)
@@ -318,11 +372,13 @@ class FiddlerMixtralWithPrefetch(FiddlerMixtral):
                 for i in range(input_ids.shape[0]):
                     decode_strings[i] += " " + self.tokenizer.decode(input_ids[i, :])
 
+            # Set metrics phase
+            self.metrics.set_phase("decode" if is_decode else "prefill")
+
             logits = self.mixtral_forward(input_ids, position_ids, is_decode)
 
-            # Advance token position after forward pass
-            if is_decode and not self.collection_mode:
-                self.profiler.advance_token_position()
+            # Advance token position after each forward pass (prefill and decode)
+            self.profiler.advance_token_position()
 
             logits = logits.to("cpu")
             logits = F.softmax(logits, dim=-1)
@@ -374,3 +430,7 @@ class FiddlerMixtralWithPrefetch(FiddlerMixtral):
         # Return hit rate from prefetch metrics instead of expert cache hit rate
         prefetch_hit_rate = self.metrics.get_hit_rate()
         return (prefill_time, decode_time, prefetch_hit_rate)
+
+    def get_prefetch_stats(self):
+        """Get detailed prefetch statistics."""
+        return self.metrics.get_stats_summary()
