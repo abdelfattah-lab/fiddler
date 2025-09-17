@@ -1,17 +1,128 @@
 # Fiddler Mixtral Optimization Project - Current Status Guide
 
 ## Guidelines while working:
-- Always update the guide.md at the end. Your goal is to keep it concise. Remove any non-important or outdated data from it and try to keep it very concise and relevant. Always specify any extra details to take care of. Always specify suggested next steps.
+- Always update the guide.md at the end. Your goal is to keep it concise. Remove any non-important or outdated data from it and try to keep it very concise and relevant. Always specify any extra details to take care of. Always specify suggested next steps. At the end, git add all files you modified including the guide and output a suggested commit message but let the user decide if they want to commit.
 
-## **Current Goal** ✅ COMPLETED
+## **Current Goal**
 
-**FIXED**: Multiple critical issues in prefetching were identified and resolved:
+This is output of 2 successfive runs:
 
-1. **JSON Key Format Mismatch**: Expert patterns used string keys (`"0"`, `"1"`) but code expected integers
-2. **Token Position Timing**: Token position only advanced during decode phase, missing prefill
-3. **Prefetch Timing**: Misalignment between when patterns were recorded vs. when they were used for prediction
+```
+(fiddler) ➜  fiddler git:(predictor_vs_fiddler) ✗ python quick_test.py FiddlerMixtralWithPrefetch 
+🚀 Quick test: FiddlerMixtralWithPrefetch
+Loading FiddlerMixtralWithPrefetch...
+/home/afa55/miniconda3/envs/fiddler/lib/python3.10/site-packages/huggingface_hub/file_download.py:943: FutureWarning: `resume_download` is deprecated and will be removed in version 1.0.0. Downloads always resume when possible. If you want to force a new download, use `force_download=True`.
+  warnings.warn(
+Loading checkpoint shards: 100%|██████████████████████████████████████████| 19/19 [00:23<00:00,  1.21s/it]
+Number of experts on GPU: 0/256
+Model is ready.
+<s> The capital of France is
+Paris
+.
+It
+is
+the
+most
+pop
+ulous
+city
+in
+France
+,
+with
+an
+--------------------
+Input: The capital of France is
+Output:  Paris . It is the most pop ulous city in France , with an
+FiddlerMixtralWithPrefetch: ' Paris . It is the most pop ulous city in France , with an' (prefill: 6.877s, decode: 22.420s, total: 29.337s)
+📊 Prefetch Statistics:
+  Overall Hit Rate: 0.0% (0/1097)
+  Decode Hit Rate: 0.0% (0/896)
+  Prefill Hit Rate: 0.0% (0/201)
+  Total Expert Requests: 1097 (Prefill: 201, Decode: 896)
+Loading FiddlerMixtral...
+Loading checkpoint shards: 100%|██████████████████████████████████████████| 19/19 [00:23<00:00,  1.26s/it]
+Number of experts on GPU: 0/256
+Model is ready.
+<s> The capital of France is
+Paris
+.
+It
+is
+the
+most
+pop
+ulous
+city
+in
+France
+,
+with
+an
+--------------------
+Input: The capital of France is
+Output:  Paris . It is the most pop ulous city in France , with an
+FiddlerMixtral: ' Paris . It is the most pop ulous city in France , with an' (prefill: 4.888s, decode: 22.001s, total: 26.889s)
+✅ MATCH! Speedup - Total: 0.92x, Prefill: 0.71x, Decode: 0.98x
+(fiddler) ➜  fiddler git:(predictor_vs_fiddler) ✗ python quick_test.py FiddlerMixtralWithPrefetch 
+🚀 Quick test: FiddlerMixtralWithPrefetch
+Loading FiddlerMixtralWithPrefetch...
+/home/afa55/miniconda3/envs/fiddler/lib/python3.10/site-packages/huggingface_hub/file_download.py:943: FutureWarning: `resume_download` is deprecated and will be removed in version 1.0.0. Downloads always resume when possible. If you want to force a new download, use `force_download=True`.
+  warnings.warn(
+Loading checkpoint shards: 100%|██████████████████████████████████████████| 19/19 [00:23<00:00,  1.22s/it]
+Number of experts on GPU: 0/256
+Model is ready.
+<s> The capital of France is
+Paris
+.
+It
+is
+the
+most
+pop
+ulous
+city
+in
+France
+,
+with
+an
+--------------------
+Input: The capital of France is
+Output:  Paris . It is the most pop ulous city in France , with an
+FiddlerMixtralWithPrefetch: ' Paris . It is the most pop ulous city in France , with an' (prefill: 6.905s, decode: 22.136s, total: 29.081s)
+📊 Prefetch Statistics:
+  Overall Hit Rate: 82.0% (900/1097)
+  Decode Hit Rate: 93.8% (840/896)
+  Prefill Hit Rate: 29.9% (60/201)
+  Total Expert Requests: 1097 (Prefill: 201, Decode: 896)
+Loading FiddlerMixtral...
+Loading checkpoint shards: 100%|██████████████████████████████████████████| 19/19 [00:23<00:00,  1.26s/it]
+Number of experts on GPU: 0/256
+Model is ready.
+<s> The capital of France is
+Paris
+.
+It
+is
+the
+most
+pop
+ulous
+city
+in
+France
+,
+with
+an
+--------------------
+Input: The capital of France is
+Output:  Paris . It is the most pop ulous city in France , with an
+FiddlerMixtral: ' Paris . It is the most pop ulous city in France , with an' (prefill: 4.934s, decode: 21.976s, total: 26.912s)
+✅ MATCH! Speedup - Total: 0.93x, Prefill: 0.71x, Decode: 0.99x
+```
 
-**RESULT**: Prefetching system now correctly stores and uses expert usage patterns. Ready for performance testing.
+It is expected that the first hit rate is 0 because the patterns aren't stored yet and the next run should have better hit rate. However, I can't understand how come both have the same speedup although one has much higher hit rate which means it should do much less work of fetching experts on demand. Let's use Nvidia Nsight Systems to profile and understand what's going on. Please do the profiling and inspect the results and update the guide with steps to address these problems.
 
 ## 🏗️ **IMPLEMENTED ARCHITECTURES**
 
