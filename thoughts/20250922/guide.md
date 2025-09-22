@@ -5,7 +5,7 @@
 
 ## Current Goal
 
-✅ **COMPLETED**: Updated profile_nsight.py with generic `profile_program()` function for profiling any program.
+Please profile for me the model Qwen/Qwen1.5-MoE-A2.7B. No need to use any fiddler code. I just want to profile it to see the difference between time of calculation and fetching active experts from memory.
 
 ## 🏗️ **IMPLEMENTED ARCHITECTURES**
 
@@ -203,9 +203,3 @@ Based on previous work, consider these proven strategies:
 - ❌ Memory transfer time INCREASES with better prefetch (15.84s vs 10.04s)
 - ✅ Hit rate measurement works correctly (0% → 82%)
 - 🚨 **URGENT**: Need to debug prefetch implementation for memory efficiency bug
-
-## 🎯 **SUGGESTED NEXT STEPS**:
-1. **Debug memory overhead in prefetch implementation** - Critical priority
-2. **Use new `profile_program()` function to profile individual components**
-3. **Investigate why hit rate improvement causes more memory transfers**
-4. **Consider alternative prefetch strategies with lower memory overhead**
