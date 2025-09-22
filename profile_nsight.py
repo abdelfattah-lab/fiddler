@@ -11,48 +11,78 @@ import time
 import argparse
 from datetime import datetime
 
-def run_nsight_profile(command_args, scenario_name, output_name, profile_dir):
-    """Run nsight profiling for a specific scenario."""
+def profile_program(command_args, scenario_name=None, output_name=None, profile_dir=None, duration=60, timeout=180):
+    """
+    Generic function to profile any program using Nvidia Nsight Systems.
+
+    Args:
+        command_args: List of command arguments to profile (e.g., ["python", "script.py", "args"])
+        scenario_name: Optional human-readable name for the profiling scenario
+        output_name: Optional output filename (without extension)
+        profile_dir: Optional directory to save profile (defaults to current directory)
+        duration: Profile duration in seconds (default: 60)
+        timeout: Timeout for the profiling process in seconds (default: 180)
+
+    Returns:
+        tuple: (success: bool, profile_path: str or None)
+    """
+    # Set defaults
+    if scenario_name is None:
+        scenario_name = f"Program: {' '.join(command_args)}"
+    if output_name is None:
+        output_name = f"profile_{int(time.time())}"
+    if profile_dir is None:
+        profile_dir = "."
+
+    # Ensure profile directory exists
+    os.makedirs(profile_dir, exist_ok=True)
+
+    profile_path = f"{profile_dir}/{output_name}.nsys-rep"
 
     # Nsight command with optimized settings for GPU memory analysis
     nsys_cmd = [
         "nsys", "profile",
-        "--output", f"{profile_dir}/{output_name}.nsys-rep",
+        "--output", profile_path,
         "--force-overwrite", "true",
         "--trace", "cuda,cudnn,cublas,osrt,nvtx",
         "--cuda-memory-usage", "true",
         "--gpu-metrics-devices", "all",  # Updated from deprecated --gpu-metrics-device
-        "--duration", "60",
+        "--duration", str(duration),
         # Remove --sample cpu as it often fails and isn't critical
     ] + command_args
 
     print(f"🔍 Profiling {scenario_name}...")
-    print(f"📁 Output: {profile_dir}/{output_name}.nsys-rep")
+    print(f"📁 Output: {profile_path}")
     print(f"🚀 Command: {' '.join(nsys_cmd)}")
 
     try:
         result = subprocess.run(nsys_cmd,
                               capture_output=True,
                               text=True,
-                              timeout=180)  # 3 minute timeout
+                              timeout=timeout)
 
         if result.returncode == 0:
             print(f"✅ {scenario_name} profiling completed successfully")
-            print(f"📊 Profile saved to: {profile_dir}/{output_name}.nsys-rep")
+            print(f"📊 Profile saved to: {profile_path}")
+            return True, profile_path
         else:
             print(f"❌ {scenario_name} profiling failed")
             print(f"stderr: {result.stderr}")
             if result.stdout:
                 print(f"stdout: {result.stdout}")
-
-        return result.returncode == 0
+            return False, None
 
     except subprocess.TimeoutExpired:
         print(f"⏱️ {scenario_name} profiling timed out")
-        return False
+        return False, None
     except Exception as e:
         print(f"💥 Error profiling {scenario_name}: {e}")
-        return False
+        return False, None
+
+def run_nsight_profile(command_args, scenario_name, output_name, profile_dir):
+    """Legacy wrapper for backward compatibility."""
+    success, profile_path = profile_program(command_args, scenario_name, output_name, profile_dir)
+    return success
 
 def generate_analysis_commands(profile_files):
     """Generate analysis commands for the given profile files."""
@@ -106,11 +136,11 @@ def baseline_vs_prefetch_mode():
     results = {}
 
     for command_args, scenario_name, output_name in implementations:
-        success = run_nsight_profile(command_args, scenario_name, output_name, profile_dir)
+        success, profile_path = profile_program(command_args, scenario_name, output_name, profile_dir)
 
         if success:
             print(f"✅ {scenario_name} profiling completed")
-            results[scenario_name] = f"{profile_dir}/{output_name}.nsys-rep"
+            results[scenario_name] = profile_path
         else:
             print(f"❌ {scenario_name} profiling failed")
 
@@ -149,11 +179,11 @@ def hit_rate_comparison_mode():
         os.remove("expert_usage_patterns.json")
 
     command_args = ["python", "quick_test.py", "FiddlerMixtralWithPrefetch"]
-    success_0 = run_nsight_profile(command_args, "0% Hit Rate", "hit_rate_0_percent", profile_dir)
+    success_0, profile_path_0 = profile_program(command_args, "0% Hit Rate", "hit_rate_0_percent", profile_dir)
 
     if success_0:
         print("✅ 0% hit rate profiling completed")
-        results["0% Hit Rate"] = f"{profile_dir}/hit_rate_0_percent.nsys-rep"
+        results["0% Hit Rate"] = profile_path_0
     else:
         print("❌ Failed to profile 0% hit rate scenario")
         return
@@ -187,11 +217,11 @@ def hit_rate_comparison_mode():
     if not os.path.exists("expert_usage_patterns.json"):
         print("⚠️ expert_usage_patterns.json not created - high hit rate test may not work")
 
-    success_high = run_nsight_profile(command_args, "High Hit Rate", "hit_rate_high_percent", profile_dir)
+    success_high, profile_path_high = profile_program(command_args, "High Hit Rate", "hit_rate_high_percent", profile_dir)
 
     if success_high:
         print("✅ High hit rate profiling completed")
-        results["High Hit Rate"] = f"{profile_dir}/hit_rate_high_percent.nsys-rep"
+        results["High Hit Rate"] = profile_path_high
     else:
         print("❌ High hit rate profiling failed")
 
