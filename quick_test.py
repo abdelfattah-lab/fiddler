@@ -25,18 +25,26 @@ from fiddler.mixtral import FiddlerMixtral
 from fiddler.mixtral_with_buffers import MixtralWithBuffers
 from fiddler.mixtral_with_predictor import FiddlerMixtralWithPredictor
 from fiddler.mixtral_with_prefetch import FiddlerMixtralWithPrefetch
+from fiddler.qwen import FiddlerQwen
+from fiddler.qwen_with_prefetch import FiddlerQwenWithPrefetch
 
 MODELS = {
     'FiddlerMixtral': FiddlerMixtral,
     'MixtralWithBuffers': MixtralWithBuffers,
     'FiddlerMixtralWithPredictor': FiddlerMixtralWithPredictor,
     'FiddlerMixtralWithPrefetch': FiddlerMixtralWithPrefetch,
+    'FiddlerQwen': FiddlerQwen,
+    'FiddlerQwenWithPrefetch': FiddlerQwenWithPrefetch,
 }
 
-def create_args():
+def create_args(model_name=None):
     class Args:
         def __init__(self):
-            self.model = 'mistralai/Mixtral-8x7B-v0.1'
+            # Use Qwen model for Qwen implementations, Mixtral for others
+            if model_name and 'Qwen' in model_name:
+                self.model = 'Qwen/Qwen1.5-MoE-A2.7B'
+            else:
+                self.model = 'mistralai/Mixtral-8x7B-v0.1'
             self.beam_width = 1
             self.cpu_offload = 0
             self.max_experts_gpu = 0
@@ -50,9 +58,9 @@ def quick_test(model_name):
 
     print(f"🚀 Quick test: {model_name}")
 
-    # Test modelthou    
+    # Test model
     print(f"Loading {model_name}...")
-    test_model = MODELS[model_name](create_args())
+    test_model = MODELS[model_name](create_args(model_name))
 
     start = time.time()
     prefill_time, decode_time, hit_rate = test_model.generate("The capital of France is", output_token=3)
@@ -65,16 +73,17 @@ def quick_test(model_name):
     torch.cuda.empty_cache()
 
     # Baseline comparison if not baseline
-    if model_name != 'FiddlerMixtral':
-        print(f"Loading FiddlerMixtral...")
-        baseline_model = FiddlerMixtral(create_args())
+    baseline_name = 'FiddlerQwen' if 'Qwen' in model_name else 'FiddlerMixtral'
+    if model_name != baseline_name:
+        print(f"Loading {baseline_name}...")
+        baseline_model = MODELS[baseline_name](create_args(model_name))
 
         start = time.time()
         base_prefill, base_decode, base_hit = baseline_model.generate("The capital of France is", output_token=3)
         base_total = time.time() - start
         baseline_output = getattr(baseline_model, 'last_generated_text', '')
 
-        print(f"FiddlerMixtral: '{baseline_output}' (prefill: {base_prefill:.3f}s, decode: {base_decode:.3f}s, total: {base_total:.3f}s)")
+        print(f"{baseline_name}: '{baseline_output}' (prefill: {base_prefill:.3f}s, decode: {base_decode:.3f}s, total: {base_total:.3f}s)")
 
         # Results
         if test_output == baseline_output:
