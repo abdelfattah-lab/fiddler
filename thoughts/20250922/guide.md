@@ -1,6 +1,16 @@
 # Fiddler MoE Optimization Project - Agent Guide
 
+## Guidelines
+
+Always update guide.md to prepare it for another agent to look at it and understand the full state of the system and keep it concise. At the end of that, add all files changed (that are relevant) including guide.md to git and suggest a commit message but let me do the git commit.
+
+
 ## Current Focus: MoE Expert Memory Optimization through prefetching
+
+
+## Current Goal
+
+The implementation of Qwen with Fiddler that was done is not correct. In both the baseline src/fiddler/qwen.py and the prefetch version src/fiddler/qwen_with_prefetch.py the experts should exclusively be executed on the GPU and should be stored on the CPU. i.e: I am expecting operations to happen to move the experts from the CPU to the GPU, for the baseline, that should be on demand and for the prefetch part, that should be based on predictions once we have the results of the predictions and it should try to overlap the prefetch with the remaining computation till the experts are needed (The prefetching is kicked 2 layers ahead similar to how src/fiddler/mixtral_with_prefetch.py is implemented). Please correct that implementation and test it to make sure it's correct.
 
 ## ✅ **COMPLETED: Qwen MoE Experiments**
 
@@ -123,16 +133,6 @@ python profile_qwen_prefetch.py
 nsight-sys qwen_prefetch_profile_*/qwen_prefetch_collection.nsys-rep
 nsight-sys qwen_prefetch_profile_*/qwen_prefetch_prediction.nsys-rep
 ```
-
-## 🚀 **Next Steps**
-
-The Qwen MoE experiments are complete and profiled. To measure speedup:
-
-1. **✅ Profile both implementations** using existing profiling infrastructure
-2. **Analyze Nsight profiles** to compare collection vs prediction performance
-3. **Run longer generations** to measure decode-phase prefetch effectiveness
-4. **Calculate speedup metrics** from profile data
-5. **Optional**: Implement true CPU/GPU expert movement for direct Fiddler comparison
 
 ---
 
