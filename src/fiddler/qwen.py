@@ -39,7 +39,10 @@ class FiddlerQwen:
         # Hook MoE layers for expert fetching
         self._hook_moe_layers()
 
-        # Set up expert management AFTER moving experts to CPU
+        # Move non-expert parts to GPU (similar to Mixtral approach)
+        self._bring_non_expert_to_gpu()
+
+        # Set up expert management AFTER moving non-experts to GPU
         self._setup_expert_management()
 
         print("✅ Model ready with Fiddler expert management")
@@ -77,6 +80,32 @@ class FiddlerQwen:
                     self.n_expert = len(layer.mlp.experts)
 
         print(f"📊 Found {len(self.moe_layers)} MoE layers with {self.n_expert} experts each")
+
+    def _bring_non_expert_to_gpu(self):
+        """Bring non-expert layers to GPU (similar to Mixtral approach)."""
+        print("🔄 Moving non-expert layers to GPU...")
+
+        # Move top-level model parts to GPU
+        self.model.lm_head.to(self.device)
+        self.model.model.embed_tokens.to(self.device)
+        self.model.model.norm.to(self.device)
+
+        # Move layer components to GPU, but keep experts on CPU
+        for i in range(len(self.model.model.layers)):
+            layer = self.model.model.layers[i]
+            # Move attention and normalization layers to GPU
+            layer.self_attn.to(self.device)
+            layer.input_layernorm.to(self.device)
+            layer.post_attention_layernorm.to(self.device)
+
+            # For MoE layers, move gate and shared expert to GPU, but keep experts on CPU
+            if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'experts'):
+                layer.mlp.gate.to(self.device)
+                layer.mlp.shared_expert.to(self.device)
+                layer.mlp.shared_expert_gate.to(self.device)
+                # layer.mlp.experts remains on CPU
+
+        print("✅ Non-expert layers moved to GPU, experts remain on CPU")
 
     def _setup_expert_management(self):
         """Set up expert management system with GPU buffer."""
@@ -242,8 +271,8 @@ class FiddlerQwen:
             text = "The capital of France is"
 
         inputs = self.tokenizer(text, return_tensors="pt")
-        input_ids = inputs.input_ids  # Keep on CPU since model is on CPU
-        attention_mask = inputs.attention_mask if inputs.attention_mask is not None else None
+        input_ids = inputs.input_ids.to(self.device)  # Move to GPU since model is now on GPU
+        attention_mask = inputs.attention_mask.to(self.device) if inputs.attention_mask is not None else None
 
         # Limit input tokens if specified
         if input_token is not None:
