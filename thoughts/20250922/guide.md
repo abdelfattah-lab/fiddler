@@ -5,6 +5,12 @@
 Always update guide.md to prepare it for another agent to look at it and understand the full state of the system and keep it concise. At the end of that, add all files changed (that are relevant) including guide.md to git and suggest a commit message but let me do the git commit.
 
 
+## Current Goal
+
+fix the implementation of src/fiddler/qwen_with_prefetch.py so that it actually performs prefetching of experts and use the experts directly without fetching them on-demand if they were already prefetched. The behavior should be similar to what's implemented in src/fiddler/mixtral_with_prefetch.py
+After implementing it and deleting the collection file, please make sure that running python simple_perf_test.py says that the Hit rate is reasonable.
+
+
 ## ✅ GOAL ACHIEVED: CPU-to-GPU Expert Management Implementation Complete
 
 **Status**: ✅ **SUCCESSFULLY IMPLEMENTED** - All model components except experts now on GPU
