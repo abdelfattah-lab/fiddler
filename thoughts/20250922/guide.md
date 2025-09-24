@@ -5,6 +5,11 @@
 Always update guide.md to prepare it for another agent to look at it and understand the full state of the system and keep it concise. At the end of that, add all files changed (that are relevant) including guide.md to git and suggest a commit message but let me do the git commit.
 
 
+## Current Goal:
+
+The fix doesn't actually work. When I run `python simple_perf_test.py`, I get wrong outputs. I would like to fix this issue.
+Another agent did some investigations and found that the issue is likely due to device_map="auto" during model loading. Let's fix that and follow the same approach in src/fiddler/mixtral.py where everything is loaded into the CPU and then we move everything except the dynamic experts into the GPU and load the dynamic experts on demand.
+
 ## Current Focus: MoE Expert Memory Optimization through prefetching
 
 
