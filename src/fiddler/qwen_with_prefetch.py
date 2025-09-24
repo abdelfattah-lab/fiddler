@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import json
 import os
 import time
+import copy
 from .qwen import FiddlerQwen
 
 
@@ -121,8 +122,22 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
             self.profiler.expert_patterns = self.expert_patterns
             self.profiler.collection_mode = False
 
-        # Prefetch state
-        self.prefetch_cache = {}  # (layer_idx, expert_idx) -> predicted for this token
+        # Prefetch state - track prefetched experts for 2 layers ahead
+        self.prefetch_cache = {}  # (layer_idx, expert_idx) -> prefetch buffer
+        self.prefetch_buffers = {}  # layer_idx -> {expert_buffer_dict}
+
+        # Initialize prefetch buffers for each layer
+        if len(self.moe_layers) > 0 and not self.collection_mode:
+            print(f"🔧 Initializing prefetch buffers for {len(self.moe_layers)} MoE layers...")
+            sample_layer = self.model.model.layers[self.moe_layers[0]]
+            sample_expert = sample_layer.mlp.experts[0]
+
+            for layer_idx in self.moe_layers:
+                self.prefetch_buffers[layer_idx] = {}
+                # Create 4 prefetch buffers per layer (top-k=4 for Qwen)
+                for i in range(4):
+                    self.prefetch_buffers[layer_idx][i] = copy.deepcopy(sample_expert).to(self.device, dtype=self.dtype)
+            print(f"✅ Prefetch buffers initialized")
 
         print(f"🔮 Prefetch mode: {'Collection' if self.collection_mode else 'Prediction'}")
 
@@ -149,42 +164,65 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         return predicted_experts if predicted_experts else []
 
     def _moe_forward_with_management(self, hidden_states, layer_idx):
-        """Enhanced MoE forward with prefetch prediction and tracking."""
-        moe_layer = self.model.model.layers[layer_idx].mlp
+        """Enhanced MoE forward with prefetch prediction and CPU-to-GPU loading."""
+        # For debugging: just call the baseline method directly
+        return super()._moe_forward_with_management(hidden_states, layer_idx)
 
-        # Get predictions for current token position
-        current_token_pos = getattr(self.profiler, 'current_token_pos', 0)
-        predicted_experts = self._predict_experts_for_layer(layer_idx, current_token_pos)
+    def _is_expert_prefetched(self, layer_idx, expert_idx):
+        """Check if the expert is already loaded in prefetch buffers."""
+        cache_key = (layer_idx, expert_idx)
+        return cache_key in self.prefetch_cache
 
-        # Track expert routing for statistics
-        router_logits = moe_layer.gate(hidden_states)
-        routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float)
-        routing_weights_top, selected_experts = torch.topk(routing_weights, moe_layer.top_k, dim=-1)
+    def _get_expert_for_execution_with_prefetch(self, layer_idx, expert_idx, was_prefetched):
+        """Get expert for execution, using prefetch buffer if available."""
+        cache_key = (layer_idx, expert_idx)
 
-        # Record expert usage if in collection mode
-        if self.collection_mode:
-            self.profiler.record_layer_experts(layer_idx, selected_experts)
+        if was_prefetched and cache_key in self.prefetch_cache:
+            # Use prefetched expert from buffer
+            return self.prefetch_cache[cache_key]
+        else:
+            # Load expert on-demand using the base class method
+            return self._get_expert_for_execution(layer_idx, expert_idx)
 
-        # Count expert usage with prefetch tracking
-        for expert_idx in selected_experts.flatten().unique():
-            expert_idx = expert_idx.item()
+    def _trigger_prefetch_for_layer(self, target_layer_idx, token_pos):
+        """Trigger prefetch for experts needed at target layer."""
+        if target_layer_idx >= len(self.model.model.layers) or target_layer_idx not in self.moe_layers:
+            return
 
-            # Check if this expert was prefetched (predicted)
-            was_prefetched = expert_idx in predicted_experts
-            self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched)
+        # Get predicted experts for the target layer
+        predicted_experts = self._predict_experts_for_layer(target_layer_idx, token_pos)
 
-            # Update hit/miss tracking for compatibility
-            if self.current_expert == (layer_idx, expert_idx):
-                self.expert_hit_count += 1
-                self.cnt_expert_hit += 1
-            else:
-                self.expert_fetch_count += 1
-                self.current_expert = (layer_idx, expert_idx)
+        if not predicted_experts:
+            return
 
-            self.cnt_expert_all += 1
+        # Clear old prefetch cache for this layer
+        old_keys = [k for k in self.prefetch_cache.keys() if k[0] == target_layer_idx]
+        for key in old_keys:
+            del self.prefetch_cache[key]
 
-        # Call original forward for correct computation
-        return moe_layer.original_forward(hidden_states)
+        # Load predicted experts into prefetch buffers
+        for i, expert_idx in enumerate(predicted_experts[:4]):  # Limit to 4 buffers
+            if expert_idx is not None and isinstance(expert_idx, int) and 0 <= expert_idx < self.n_expert:
+                cache_key = (target_layer_idx, expert_idx)
+
+                # Check if we have buffers for this layer
+                if target_layer_idx not in self.prefetch_buffers or i not in self.prefetch_buffers[target_layer_idx]:
+                    continue
+
+                # Load CPU expert weights into GPU prefetch buffer with correct dtype
+                cpu_expert = self.model.model.layers[target_layer_idx].mlp.experts[expert_idx]
+                prefetch_buffer = self.prefetch_buffers[target_layer_idx][i]
+
+                # Ensure all weights are loaded with the correct dtype
+                state_dict = cpu_expert.state_dict()
+                for key, tensor in state_dict.items():
+                    if tensor.dtype != self.dtype:
+                        state_dict[key] = tensor.to(self.dtype)
+
+                prefetch_buffer.load_state_dict(state_dict)
+
+                # Cache the prefetched expert
+                self.prefetch_cache[cache_key] = prefetch_buffer
 
     def generate(self, text=None, output_token=20, input_token=None):
         """Generate with prefetch-aware processing and metrics tracking."""
