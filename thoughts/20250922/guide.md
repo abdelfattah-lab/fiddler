@@ -4,6 +4,7 @@
 
 Always update guide.md to prepare it for another agent to look at it and understand the full state of the system and keep it concise. At the end of that, add all files changed (that are relevant) including guide.md to git and suggest a commit message but let me do the git commit.
 
+* You will be working in the dangerous mode very autonomously. Do not remove any files and do not take any shortcuts. Always make sure of the correctness of the implementation if you change anything and if you face an issue, debug it in methodological steps using debug prints rather than random guessing and keep working till you have achieved the goal. never stop before it but keep trying till you achieve it.
 
 ## Current Focus: MoE Expert Memory Optimization through prefetching
 
@@ -82,6 +83,7 @@ Always update guide.md to prepare it for another agent to look at it and underst
 2. **Performance comparison**: Measure speedup of prefetching vs baseline fiddler approach
 3. **Hit rate analysis**: Analyze prefetch effectiveness and pattern learning
 4. **Memory transfer optimization**: Measure impact of reduced CPU-GPU transfers
+5. Plot a graph showing on the X-axis the batch size and on the Y-axis the speedup of Prefetching vs Baseline
 
 ### **Debugging Resources Available**
 - `debug_moe.py`: Proves MoE logic is correct in isolation
