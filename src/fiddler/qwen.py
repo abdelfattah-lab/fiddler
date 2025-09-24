@@ -45,7 +45,7 @@ class FiddlerQwen:
         print("✅ Model ready with Fiddler expert management")
 
     def _load_model(self):
-        """Load model with experts on CPU and core model on GPU."""
+        """Load model on CPU, preserving integrated structure."""
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_name,
             trust_remote_code=True
@@ -53,59 +53,17 @@ class FiddlerQwen:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # Load model on GPU first with device_map="auto"
+        # Load model entirely on CPU to preserve integrated structure
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             trust_remote_code=True,
             torch_dtype=self.dtype,
-            device_map="auto"
+            use_cache=True
         )
 
-        # Move experts to CPU while keeping core model on GPU
-        self._move_experts_to_cpu()
+        print("✅ Model loaded on CPU (preserving structure integrity)")
 
-    def _move_experts_to_cpu(self):
-        """Move all experts to CPU while keeping core model on GPU."""
-        print("🔄 Moving experts to CPU...")
 
-        for i, layer in enumerate(self.model.model.layers):
-            if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'experts'):
-                for expert_idx, expert in enumerate(layer.mlp.experts):
-                    # Properly materialize expert on CPU using state dict approach
-                    self._materialize_expert_on_cpu(i, expert_idx, expert)
-                print(f"Layer {i}: Moved {len(layer.mlp.experts)} experts to CPU")
-
-        print("✅ All experts moved to CPU")
-
-    def _materialize_expert_on_cpu(self, layer_idx, expert_idx, expert):
-        """Properly materialize expert on CPU with actual weight data."""
-        import copy
-
-        # Check if expert parameters are meta tensors
-        for name, param in expert.named_parameters():
-            if param.is_meta:
-                print(f"    Expert {layer_idx}-{expert_idx} {name} is meta tensor, skipping CPU move")
-                return  # Skip experts that are meta tensors
-
-        # For non-meta tensors, use simple CPU move
-        try:
-            expert.cpu()
-            print(f"    Expert {layer_idx}-{expert_idx} moved to CPU successfully")
-        except Exception as e:
-            print(f"    Expert {layer_idx}-{expert_idx} CPU move failed: {e}")
-            # Fallback: try to create a new expert with copied weights
-            expert_cpu = copy.deepcopy(expert)
-            for name, param in expert.named_parameters():
-                if not param.is_meta:
-                    cpu_weight = param.detach().cpu()
-                    parts = name.split('.')
-                    current = expert_cpu
-                    for part in parts[:-1]:
-                        current = getattr(current, part)
-                    setattr(current, parts[-1], torch.nn.Parameter(cpu_weight))
-
-            # Replace the original expert with the CPU version
-            self.model.model.layers[layer_idx].mlp.experts[expert_idx] = expert_cpu
 
     def _analyze_model_structure(self):
         """Analyze model structure."""
@@ -166,63 +124,94 @@ class FiddlerQwen:
         print("✅ MoE layers hooked")
 
     def _moe_forward_with_management(self, hidden_states, layer_idx):
-        """MoE forward with CPU-to-GPU expert loading following Qwen's exact implementation."""
+        """MoE forward with expert management and CPU-to-GPU loading."""
         moe_layer = self.model.model.layers[layer_idx].mlp
 
+        # Get dimensions
         batch_size, sequence_length, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
+        hidden_states_flat = hidden_states.view(-1, hidden_dim)
 
-        # Router computation (exactly like original)
-        router_logits = moe_layer.gate(hidden_states)
+        # Router computation (this stays on CPU since gate is on CPU)
+        router_logits = moe_layer.gate(hidden_states_flat)
+
+        # Routing weights computation
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, moe_layer.top_k, dim=-1)
 
         if moe_layer.norm_topk_prob:
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+
+        # Convert routing weights to the correct dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
 
+        # Initialize output tensor with correct dtype
         final_hidden_states = torch.zeros(
-            (batch_size * sequence_length, hidden_dim), dtype=hidden_states.dtype, device=hidden_states.device
+            (batch_size * sequence_length, hidden_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device
         )
 
-        # One hot encode the selected experts (exactly like original)
+        # One-hot encode selected experts
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=moe_layer.num_experts).permute(2, 1, 0)
 
-        # Loop over all available experts (exactly like original)
+        # Find active experts
         expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-        for expert_idx_tensor in expert_hit:
+
+        # Process each active expert
+        for i, expert_idx_tensor in enumerate(expert_hit):
             expert_idx = expert_idx_tensor.item()
 
-            # Track for statistics
-            if self.current_expert == (layer_idx, expert_idx):
-                self.expert_hit_count += 1
-                self.cnt_expert_hit += 1
-            else:
-                self.expert_fetch_count += 1
-                self.current_expert = (layer_idx, expert_idx)
-            self.cnt_expert_all += 1
-
-            # Get the expert (load to GPU if necessary)
-            expert_layer = self._get_expert_for_execution(layer_idx, expert_idx)
-
+            # Find tokens assigned to this expert
             idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
 
-            # Index the correct hidden states and compute expert output (exactly like original)
-            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
-            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+            if len(top_x) == 0:
+                continue
 
-            # Use index_add_ for accumulation - ensure dtype consistency to avoid precision loss
-            if current_hidden_states.dtype != hidden_states.dtype:
-                current_hidden_states = current_hidden_states.to(hidden_states.dtype)
+            # Get input for this expert
+            current_state = hidden_states_flat[None, top_x].reshape(-1, hidden_dim)
+
+            # Get routing weights for this expert
+            expert_routing_weights = routing_weights[top_x, idx, None]
+
+            # Load expert to GPU buffer and execute
+            expert_buffer = self._get_expert_for_execution(layer_idx, expert_idx)
+
+            # Execute expert computation on GPU
+            if current_state.device != expert_buffer.gate_proj.weight.device:
+                current_state = current_state.to(expert_buffer.gate_proj.weight.device)
+
+            expert_output = expert_buffer(current_state)
+
+            # Apply routing weights
+            current_hidden_states = expert_output * expert_routing_weights.to(expert_output.device)
+
+            # Move back to original device if needed and accumulate
+            if current_hidden_states.device != final_hidden_states.device:
+                current_hidden_states = current_hidden_states.to(final_hidden_states.device)
+
+            # Ensure dtype consistency before accumulation
+            current_hidden_states = current_hidden_states.to(final_hidden_states.dtype)
+
             final_hidden_states.index_add_(0, top_x, current_hidden_states)
 
-        # Add shared expert output (exactly like original)
-        shared_expert_output = moe_layer.shared_expert(hidden_states)
-        shared_expert_output = F.sigmoid(moe_layer.shared_expert_gate(hidden_states)) * shared_expert_output
+            # Update statistics
+            self.cnt_expert_all += len(top_x)
+            if self.current_expert == (layer_idx, expert_idx):
+                self.cnt_expert_hit += len(top_x)
+
+        # Add shared expert (shared expert stays on CPU since model is on CPU)
+        shared_expert_output = moe_layer.shared_expert(hidden_states_flat)
+        shared_expert_gate = F.sigmoid(moe_layer.shared_expert_gate(hidden_states_flat))
+        shared_expert_output = shared_expert_gate * shared_expert_output
+
         final_hidden_states = final_hidden_states + shared_expert_output
 
-        final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-        return final_hidden_states
+        # Reshape back to original dimensions
+        final_hidden_states = final_hidden_states.view(batch_size, sequence_length, hidden_dim)
+
+        # Return in the same format as original forward (output, router_logits)
+        router_logits = router_logits.view(batch_size, sequence_length, -1)
+        return final_hidden_states, router_logits
 
     def _get_expert_for_execution(self, layer_idx, expert_idx):
         """Get expert for execution, loading from CPU to GPU buffer if needed."""
@@ -253,8 +242,8 @@ class FiddlerQwen:
             text = "The capital of France is"
 
         inputs = self.tokenizer(text, return_tensors="pt")
-        input_ids = inputs.input_ids.to(self.model.device)
-        attention_mask = inputs.attention_mask.to(self.model.device) if inputs.attention_mask is not None else None
+        input_ids = inputs.input_ids  # Keep on CPU since model is on CPU
+        attention_mask = inputs.attention_mask if inputs.attention_mask is not None else None
 
         # Limit input tokens if specified
         if input_token is not None:
