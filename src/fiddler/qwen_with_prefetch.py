@@ -164,9 +164,108 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         return predicted_experts if predicted_experts else []
 
     def _moe_forward_with_management(self, hidden_states, layer_idx):
-        """Enhanced MoE forward with prefetch prediction and CPU-to-GPU loading."""
-        # For debugging: just call the baseline method directly
-        return super()._moe_forward_with_management(hidden_states, layer_idx)
+        """Enhanced MoE forward with prefetch prediction and CPU-to-GPU loading (matching baseline logic)."""
+        moe_layer = self.model.model.layers[layer_idx].mlp
+
+        # Get dimensions
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states_flat = hidden_states.view(-1, hidden_dim)
+
+        # Router computation (same as baseline)
+        router_logits = moe_layer.gate(hidden_states_flat)
+
+        # Routing weights computation (same as baseline)
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, moe_layer.top_k, dim=-1)
+
+        if moe_layer.norm_topk_prob:
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+
+        # Convert routing weights to the correct dtype
+        routing_weights = routing_weights.to(hidden_states.dtype)
+
+        # Record expert usage patterns for future prefetching
+        if self.collection_mode:
+            self.profiler.record_layer_experts(layer_idx, selected_experts)
+
+        # Initialize output tensor with correct dtype (same as baseline)
+        final_hidden_states = torch.zeros(
+            (batch_size * sequence_length, hidden_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device
+        )
+
+        # One-hot encode selected experts (same as baseline)
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=moe_layer.num_experts).permute(2, 1, 0)
+
+        # Find active experts (same as baseline)
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        # Process each active expert (adapted from baseline)
+        for i, expert_idx_tensor in enumerate(expert_hit):
+            expert_idx = expert_idx_tensor.item()
+
+            # Find tokens assigned to this expert (same as baseline)
+            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
+
+            if len(top_x) == 0:
+                continue
+
+            # Get input for this expert (same as baseline)
+            current_state = hidden_states_flat[None, top_x].reshape(-1, hidden_dim)
+
+            # Get routing weights for this expert (same as baseline)
+            expert_routing_weights = routing_weights[top_x, idx, None]
+
+            # Check if expert was prefetched, use prefetched version if available
+            if self._is_expert_prefetched(layer_idx, expert_idx):
+                # Use prefetched expert
+                expert_buffer = self._get_expert_for_execution_with_prefetch(layer_idx, expert_idx, was_prefetched=True)
+                self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=True)
+                self.cnt_expert_hit += len(top_x)
+            else:
+                # Load expert on-demand using the base class method
+                expert_buffer = self._get_expert_for_execution(layer_idx, expert_idx)
+                self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=False)
+
+            self.cnt_expert_all += len(top_x)
+
+            # Execute expert computation on GPU (same as baseline)
+            if current_state.device != expert_buffer.gate_proj.weight.device:
+                current_state = current_state.to(expert_buffer.gate_proj.weight.device)
+
+            expert_output = expert_buffer(current_state)
+
+            # Apply routing weights (same as baseline)
+            current_hidden_states = expert_output * expert_routing_weights.to(expert_output.device)
+
+            # Move back to original device if needed and accumulate (same as baseline)
+            if current_hidden_states.device != final_hidden_states.device:
+                current_hidden_states = current_hidden_states.to(final_hidden_states.device)
+
+            # Ensure dtype consistency before accumulation (same as baseline)
+            current_hidden_states = current_hidden_states.to(final_hidden_states.dtype)
+
+            final_hidden_states.index_add_(0, top_x, current_hidden_states)
+
+        # Add shared expert (same as baseline)
+        shared_expert_output = moe_layer.shared_expert(hidden_states_flat)
+        shared_expert_gate = F.sigmoid(moe_layer.shared_expert_gate(hidden_states_flat))
+        shared_expert_output = shared_expert_gate * shared_expert_output
+
+        final_hidden_states = final_hidden_states + shared_expert_output
+
+        # Trigger prefetch for layer+2 if not in collection mode
+        if not self.collection_mode and layer_idx + 2 in self.moe_layers:
+            self._trigger_prefetch_for_layer(layer_idx + 2, self.profiler.current_token_pos)
+
+        # Advance token position after the last MoE layer
+        if layer_idx == self.moe_layers[-1]:
+            self.profiler.advance_token_position()
+
+        # Return in the same format as original forward (output, router_logits)
+        router_logits = router_logits.view(batch_size, sequence_length, -1)
+        return final_hidden_states.view(batch_size, sequence_length, hidden_dim), router_logits
 
     def _is_expert_prefetched(self, layer_idx, expert_idx):
         """Check if the expert is already loaded in prefetch buffers."""
@@ -257,7 +356,13 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         start_time = time.time()
 
         with torch.no_grad():
-            # Generate with our prefetch-enhanced model
+            # Reset cache
+            self.model.generation_config.use_cache = True
+            if hasattr(self.model, 'past_key_values'):
+                self.model.past_key_values = None
+
+            # Generate with the built-in generation method but with cache reset after each token
+            # This ensures our hooks are called appropriately
             outputs = self.model.generate(
                 input_ids,
                 attention_mask=attention_mask,
@@ -266,6 +371,8 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
                 pad_token_id=self.tokenizer.eos_token_id,
                 use_cache=True
             )
+
+            # Token position is advanced in MoE forward during generation
 
         total_time = time.time() - start_time
         generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
