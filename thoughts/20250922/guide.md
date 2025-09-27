@@ -4,7 +4,43 @@
 
 Always update guide.md to prepare it for another agent to look at it and understand the full state of the system and keep it concise. At the end of that, add all files changed (that are relevant) including guide.md to git and suggest a commit message but let me do the git commit.
 
-## ✅ GOAL ACHIEVED: Dual Buffer System Implementation Complete
+Current Goal:
+
+The implementation of qwen_with_prefetch does the prefetching in a synchronous way. I would like to change that so that it runs in a separate CUDA Stream and in parallel with the other computations that are happening till that layer arrives.
+
+## ✅ COMPLETED: Qwen Prefetch Nsight Profiling
+
+**Status**: ✅ **SUCCESSFULLY COMPLETED** - Generated fresh Nsight profiles for qwen_with_prefetch
+
+**📁 Report Location**: `qwen_prefetch_profile_20250927_165134/`
+
+**✅ Generated Reports**:
+- **Collection Mode**: `qwen_prefetch_profile_20250927_165134/qwen_prefetch_collection.nsys-rep`
+  - Pattern learning phase (0% prefetch hit rate)
+  - Fresh profiling run for baseline comparison
+- **Prediction Mode**: `qwen_prefetch_profile_20250927_165134/qwen_prefetch_prediction.nsys-rep`
+  - Active prefetching phase with learned patterns
+  - Shows prefetch utilization and expert memory transfer patterns
+
+**🔍 GUI Analysis Commands**:
+```bash
+# Collection mode analysis
+nsight-sys qwen_prefetch_profile_20250927_165134/qwen_prefetch_collection.nsys-rep
+
+# Prediction mode analysis
+nsight-sys qwen_prefetch_profile_20250927_165134/qwen_prefetch_prediction.nsys-rep
+```
+
+**📊 Additional Analysis Options**:
+```bash
+# Memory transfer comparison
+nsys stats --report cuda_gpu_mem_time_sum qwen_prefetch_profile_20250927_165134/qwen_prefetch_collection.nsys-rep
+nsys stats --report cuda_gpu_mem_time_sum qwen_prefetch_profile_20250927_165134/qwen_prefetch_prediction.nsys-rep
+
+# NVTX markers (if available in prediction mode)
+nsys stats --report nvtx_sum qwen_prefetch_profile_20250927_165134/qwen_prefetch_prediction.nsys-rep
+```
+
 
 **Status**: ✅ **SUCCESSFULLY IMPLEMENTED** - Dual buffer system with Buffer A/B alternating design
 
