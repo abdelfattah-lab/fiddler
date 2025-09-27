@@ -12,6 +12,13 @@ import time
 import copy
 from .qwen import FiddlerQwen
 
+# Import NVTX for profiling markers
+try:
+    import nvtx
+    NVTX_AVAILABLE = True
+except ImportError:
+    NVTX_AVAILABLE = False
+
 
 class ExpertUsageProfiler:
     """Records and provides expert usage patterns for prediction."""
@@ -122,22 +129,29 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
             self.profiler.expert_patterns = self.expert_patterns
             self.profiler.collection_mode = False
 
-        # Prefetch state - track prefetched experts for 2 layers ahead
-        self.prefetch_cache = {}  # (layer_idx, expert_idx) -> prefetch buffer
-        self.prefetch_buffers = {}  # layer_idx -> {expert_buffer_dict}
+        # Dual buffer system - Buffer A for even layers, Buffer B for odd layers
+        self.prefetch_cache_A = {}  # (layer_idx, expert_idx) -> prefetch buffer (even layers)
+        self.prefetch_cache_B = {}  # (layer_idx, expert_idx) -> prefetch buffer (odd layers)
+        self.prefetch_buffer_A = {}  # Buffer A: 4 expert slots for even layers
+        self.prefetch_buffer_B = {}  # Buffer B: 4 expert slots for odd layers
 
-        # Initialize prefetch buffers for each layer
+        # Initialize dual buffer system
         if len(self.moe_layers) > 0 and not self.collection_mode:
-            print(f"🔧 Initializing prefetch buffers for {len(self.moe_layers)} MoE layers...")
+            print(f"🔧 Initializing dual buffer system for {len(self.moe_layers)} MoE layers...")
             sample_layer = self.model.model.layers[self.moe_layers[0]]
             sample_expert = sample_layer.mlp.experts[0]
 
-            for layer_idx in self.moe_layers:
-                self.prefetch_buffers[layer_idx] = {}
-                # Create 4 prefetch buffers per layer (top-k=4 for Qwen)
-                for i in range(4):
-                    self.prefetch_buffers[layer_idx][i] = copy.deepcopy(sample_expert).to(self.device, dtype=self.dtype)
-            print(f"✅ Prefetch buffers initialized")
+            # Create Buffer A (4 expert slots for even layers)
+            self.prefetch_buffer_A = {}
+            for i in range(4):
+                self.prefetch_buffer_A[i] = copy.deepcopy(sample_expert).to(self.device, dtype=self.dtype)
+
+            # Create Buffer B (4 expert slots for odd layers)
+            self.prefetch_buffer_B = {}
+            for i in range(4):
+                self.prefetch_buffer_B[i] = copy.deepcopy(sample_expert).to(self.device, dtype=self.dtype)
+
+            print(f"✅ Dual buffer system initialized (Buffer A for even layers, Buffer B for odd layers)")
 
         print(f"🔮 Prefetch mode: {'Collection' if self.collection_mode else 'Prediction'}")
 
@@ -220,12 +234,20 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
             # Check if expert was prefetched, use prefetched version if available
             if self._is_expert_prefetched(layer_idx, expert_idx):
                 # Use prefetched expert
+                if NVTX_AVAILABLE:
+                    range_id = nvtx.start_range(f"PREFETCH_HIT: Layer{layer_idx}_Expert{expert_idx}")
                 expert_buffer = self._get_expert_for_execution_with_prefetch(layer_idx, expert_idx, was_prefetched=True)
+                if NVTX_AVAILABLE:
+                    nvtx.end_range(range_id)
                 self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=True)
                 self.cnt_expert_hit += len(top_x)
             else:
                 # Load expert on-demand using the base class method
+                if NVTX_AVAILABLE:
+                    range_id = nvtx.start_range(f"EXPERT_LOAD_ON_DEMAND: Layer{layer_idx}_Expert{expert_idx}")
                 expert_buffer = self._get_expert_for_execution(layer_idx, expert_idx)
+                if NVTX_AVAILABLE:
+                    nvtx.end_range(range_id)
                 self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=False)
 
             self.cnt_expert_all += len(top_x)
@@ -257,7 +279,11 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
 
         # Trigger prefetch for layer+2 if not in collection mode
         if not self.collection_mode and layer_idx + 2 in self.moe_layers:
+            if NVTX_AVAILABLE:
+                range_id = nvtx.start_range(f"EXPERT_PREFETCH_TRIGGER: Layer{layer_idx+2}")
             self._trigger_prefetch_for_layer(layer_idx + 2, self.profiler.current_token_pos)
+            if NVTX_AVAILABLE:
+                nvtx.end_range(range_id)
 
         # Advance token position after the last MoE layer
         if layer_idx == self.moe_layers[-1]:
@@ -270,18 +296,31 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
     def _is_expert_prefetched(self, layer_idx, expert_idx):
         """Check if the expert is already loaded in prefetch buffers."""
         cache_key = (layer_idx, expert_idx)
-        return cache_key in self.prefetch_cache
+        # Check appropriate buffer based on layer parity
+        if self._get_layer_index_in_moe_list(layer_idx) % 2 == 0:
+            return cache_key in self.prefetch_cache_A
+        else:
+            return cache_key in self.prefetch_cache_B
+
+    def _get_layer_index_in_moe_list(self, layer_idx):
+        """Get the index of this layer in the MoE layers list (for parity calculation)."""
+        return self.moe_layers.index(layer_idx) if layer_idx in self.moe_layers else 0
 
     def _get_expert_for_execution_with_prefetch(self, layer_idx, expert_idx, was_prefetched):
-        """Get expert for execution, using prefetch buffer if available."""
+        """Get expert for execution, using appropriate prefetch buffer if available."""
         cache_key = (layer_idx, expert_idx)
 
-        if was_prefetched and cache_key in self.prefetch_cache:
-            # Use prefetched expert from buffer
-            return self.prefetch_cache[cache_key]
-        else:
-            # Load expert on-demand using the base class method
-            return self._get_expert_for_execution(layer_idx, expert_idx)
+        if was_prefetched:
+            # Use appropriate buffer based on layer parity
+            if self._get_layer_index_in_moe_list(layer_idx) % 2 == 0:
+                if cache_key in self.prefetch_cache_A:
+                    return self.prefetch_cache_A[cache_key]
+            else:
+                if cache_key in self.prefetch_cache_B:
+                    return self.prefetch_cache_B[cache_key]
+
+        # Load expert on-demand using the base class method
+        return self._get_expert_for_execution(layer_idx, expert_idx)
 
     def _trigger_prefetch_for_layer(self, target_layer_idx, token_pos):
         """Trigger prefetch for experts needed at target layer."""
@@ -294,23 +333,41 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         if not predicted_experts:
             return
 
-        # Clear old prefetch cache for this layer
-        old_keys = [k for k in self.prefetch_cache.keys() if k[0] == target_layer_idx]
-        for key in old_keys:
-            del self.prefetch_cache[key]
+        # Determine which buffer to use based on layer parity
+        layer_moe_index = self._get_layer_index_in_moe_list(target_layer_idx)
+        is_even_layer = layer_moe_index % 2 == 0
 
-        # Load predicted experts into prefetch buffers
+        # Clear old prefetch cache for this layer from appropriate buffer
+        if is_even_layer:
+            old_keys = [k for k in self.prefetch_cache_A.keys() if k[0] == target_layer_idx]
+            for key in old_keys:
+                del self.prefetch_cache_A[key]
+            current_cache = self.prefetch_cache_A
+            current_buffer = self.prefetch_buffer_A
+            buffer_name = "Buffer A (even)"
+        else:
+            old_keys = [k for k in self.prefetch_cache_B.keys() if k[0] == target_layer_idx]
+            for key in old_keys:
+                del self.prefetch_cache_B[key]
+            current_cache = self.prefetch_cache_B
+            current_buffer = self.prefetch_buffer_B
+            buffer_name = "Buffer B (odd)"
+
+        # Load predicted experts into appropriate prefetch buffer
         for i, expert_idx in enumerate(predicted_experts[:4]):  # Limit to 4 buffers
             if expert_idx is not None and isinstance(expert_idx, int) and 0 <= expert_idx < self.n_expert:
                 cache_key = (target_layer_idx, expert_idx)
 
-                # Check if we have buffers for this layer
-                if target_layer_idx not in self.prefetch_buffers or i not in self.prefetch_buffers[target_layer_idx]:
+                # Check if we have the buffer slot
+                if i not in current_buffer:
                     continue
 
                 # Load CPU expert weights into GPU prefetch buffer with correct dtype
+                if NVTX_AVAILABLE:
+                    range_id = nvtx.start_range(f"EXPERT_PREFETCH_LOAD: Layer{target_layer_idx}_Expert{expert_idx}_{buffer_name}_Slot{i}")
+
                 cpu_expert = self.model.model.layers[target_layer_idx].mlp.experts[expert_idx]
-                prefetch_buffer = self.prefetch_buffers[target_layer_idx][i]
+                prefetch_buffer = current_buffer[i]
 
                 # Ensure all weights are loaded with the correct dtype
                 state_dict = cpu_expert.state_dict()
@@ -320,8 +377,11 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
 
                 prefetch_buffer.load_state_dict(state_dict)
 
-                # Cache the prefetched expert
-                self.prefetch_cache[cache_key] = prefetch_buffer
+                # Cache the prefetched expert in appropriate buffer
+                current_cache[cache_key] = prefetch_buffer
+
+                if NVTX_AVAILABLE:
+                    nvtx.end_range(range_id)
 
     def generate(self, text=None, output_token=20, input_token=None):
         """Generate with prefetch-aware processing and metrics tracking."""

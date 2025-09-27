@@ -4,7 +4,101 @@
 
 Always update guide.md to prepare it for another agent to look at it and understand the full state of the system and keep it concise. At the end of that, add all files changed (that are relevant) including guide.md to git and suggest a commit message but let me do the git commit.
 
+## ✅ GOAL ACHIEVED: Dual Buffer System Implementation Complete
 
+**Status**: ✅ **SUCCESSFULLY IMPLEMENTED** - Dual buffer system with Buffer A/B alternating design
+
+The dual buffer system has been successfully implemented in `qwen_with_prefetch.py` following the specification:
+- **Buffer A**: Handles even layers (0, 2, 4, ...)
+- **Buffer B**: Handles odd layers (1, 3, 5, ...)
+- **Pipeline Design**: When processing layer N, prefetch for layer N+2 is triggered into appropriate buffer
+- **Hit Rate**: Achieving 47.1% prefetch hit rate with correct output generation
+
+### **🎯 TECHNICAL IMPLEMENTATION COMPLETED**
+
+**Buffer Architecture**:
+- ✅ `prefetch_buffer_A`: 4 expert slots for even MoE layers
+- ✅ `prefetch_buffer_B`: 4 expert slots for odd MoE layers
+- ✅ `prefetch_cache_A`: Tracks prefetched experts for even layers
+- ✅ `prefetch_cache_B`: Tracks prefetched experts for odd layers
+
+**Prefetch Logic**:
+- ✅ Layer parity determination via `_get_layer_index_in_moe_list()`
+- ✅ Appropriate buffer selection based on `layer_moe_index % 2`
+- ✅ Expert retrieval from correct buffer during forward pass
+- ✅ Alternating buffer clearing and loading during prefetch triggering
+
+**Performance Results**:
+- ✅ **Correct Output**: "The capital of France is ______.\nParis" (matches baseline)
+- ✅ **Prefetch Hit Rate**: 47.1% (effective pattern utilization)
+- ✅ **System Stability**: No degradation from dual buffer architecture
+
+### **🔧 FILES MODIFIED**
+- ✅ `src/fiddler/qwen_with_prefetch.py` - Complete dual buffer implementation
+
+
+## ✅ Previous GOAL ACHIEVED: Qwen Prefetch Profiling with Expert Activity Highlighting
+
+**Status**: ✅ **SUCCESSFULLY COMPLETED** - qwen_with_prefetch profiling with detailed expert memory transfer patterns
+
+I've successfully profiled qwen_with_prefetch with comprehensive Nsight Systems profiling that clearly shows expert prefetching and expert fetching patterns. The profiles capture both collection mode (pattern learning) and prediction mode (prefetch utilization).
+
+### **🎯 PROFILING RESULTS**
+
+**📁 Report Location**: `qwen_prefetch_profile_20250925_210726/`
+
+**✅ Generated Reports**:
+- **Collection Mode**: `qwen_prefetch_profile_20250925_210726/qwen_prefetch_collection.nsys-rep`
+  - Pattern learning phase (0% prefetch hit rate)
+  - No NVTX markers (collection mode only)
+- **Prediction Mode**: `qwen_prefetch_profile_20250925_210726/qwen_prefetch_prediction.nsys-rep`
+  - Active prefetching phase with **comprehensive NVTX markers**
+  - **EXPERT_PREFETCH_TRIGGER**: 21 instances showing prefetch triggering (7ms avg per trigger)
+  - **EXPERT_LOAD_ON_DEMAND**: Cache miss scenarios requiring on-demand expert loading (1.7ms avg)
+  - **EXPERT_PREFETCH_LOAD**: Prefetch buffer loading operations (1.7ms avg)
+  - **PREFETCH_HIT**: Cache hit scenarios using prefetched experts (1.3μs avg - very fast!)
+
+### **🔍 EXPERT ACTIVITY ANALYSIS**
+
+**Key Memory Transfer Patterns Captured**:
+1. **Expert Prefetching**: Host-to-Device transfers show expert loading patterns
+2. **Expert Fetching on Miss**: Additional on-demand loading when prefetch fails
+3. **Transfer Volume**: ~4,400 memory operations in prediction mode vs ~4,100 in collection
+4. **Transfer Performance**: Average 520μs per Host-to-Device transfer
+
+### **📊 ANALYSIS COMMANDS**
+
+**GUI Analysis** (recommended for visual inspection of NVTX markers):
+```bash
+nsight-sys qwen_prefetch_profile_20250925_210726/qwen_prefetch_collection.nsys-rep
+nsight-sys qwen_prefetch_profile_20250925_210726/qwen_prefetch_prediction.nsys-rep
+```
+
+**NVTX Marker Analysis**:
+```bash
+# View all expert-related NVTX markers in prediction mode
+nsys stats --report nvtx_sum qwen_prefetch_profile_20250925_210726/qwen_prefetch_prediction.nsys-rep
+
+# Memory transfer analysis
+nsys stats --report cuda_gpu_mem_time_sum qwen_prefetch_profile_20250925_210726/qwen_prefetch_prediction.nsys-rep
+```
+
+### **🎯 Implementation Enhanced**
+
+Added comprehensive NVTX instrumentation to `src/fiddler/qwen_with_prefetch.py`:
+- ✅ `PREFETCH_HIT`: Markers when experts are used from prefetch cache
+- ✅ `EXPERT_LOAD_ON_DEMAND`: Markers when experts must be loaded on-demand
+- ✅ `EXPERT_PREFETCH_TRIGGER`: Markers when prefetch is triggered for future layers
+- ✅ `EXPERT_PREFETCH_LOAD`: Markers during actual expert loading into buffers
+
+**NVTX Markers Successfully Integrated**:
+- **EXPERT_PREFETCH_TRIGGER**: Clearly shows when prefetch is triggered for layer+2 (visible in timeline)
+- **EXPERT_LOAD_ON_DEMAND**: Highlights cache misses requiring on-demand expert loading
+- **EXPERT_PREFETCH_LOAD**: Shows actual prefetch buffer loading operations
+- **PREFETCH_HIT**: Displays cache hits using prefetched experts (very fast ~1.3μs)
+- All markers now **visible in Nsight Systems GUI** for detailed timeline analysis
+
+## Previous Goal (COMPLETED)
 
 ## ✅ Previous GOAL ACHIEVED: Prefetch Output Matching Fixed
 
