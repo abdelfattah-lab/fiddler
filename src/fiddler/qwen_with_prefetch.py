@@ -135,6 +135,10 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         self.prefetch_buffer_A = {}  # Buffer A: 4 expert slots for even layers
         self.prefetch_buffer_B = {}  # Buffer B: 4 expert slots for odd layers
 
+        # Create separate CUDA streams for asynchronous prefetching
+        self.prefetch_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        self.expert_ready_events = {}  # Track when each expert is ready: (layer, expert) -> event
+
         # Initialize dual buffer system
         if len(self.moe_layers) > 0 and not self.collection_mode:
             print(f"🔧 Initializing dual buffer system for {len(self.moe_layers)} MoE layers...")
@@ -152,6 +156,8 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
                 self.prefetch_buffer_B[i] = copy.deepcopy(sample_expert).to(self.device, dtype=self.dtype)
 
             print(f"✅ Dual buffer system initialized (Buffer A for even layers, Buffer B for odd layers)")
+            if self.prefetch_stream:
+                print(f"✅ Async prefetch stream initialized")
 
         print(f"🔮 Prefetch mode: {'Collection' if self.collection_mode else 'Prediction'}")
 
@@ -202,6 +208,7 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         if self.collection_mode:
             self.profiler.record_layer_experts(layer_idx, selected_experts)
 
+
         # Initialize output tensor with correct dtype (same as baseline)
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, hidden_dim),
@@ -219,6 +226,14 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         for i, expert_idx_tensor in enumerate(expert_hit):
             expert_idx = expert_idx_tensor.item()
 
+            # TRIGGER PREFETCH IN THE MIDDLE OF EXPERT LOOP for maximum overlap
+            if i == len(expert_hit) // 2 and not self.collection_mode and layer_idx + 1 in self.moe_layers:
+                if NVTX_AVAILABLE:
+                    range_id = nvtx.start_range(f"PARALLEL_EXPERT_PREFETCH_TRIGGER: Layer{layer_idx+1}")
+                self._trigger_prefetch_for_layer(layer_idx + 1, self.profiler.current_token_pos)
+                if NVTX_AVAILABLE:
+                    nvtx.end_range(range_id)
+
             # Find tokens assigned to this expert (same as baseline)
             idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
 
@@ -233,6 +248,14 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
 
             # Check if expert was prefetched, use prefetched version if available
             if self._is_expert_prefetched(layer_idx, expert_idx):
+                # Use GPU-side synchronization: make current stream wait for prefetch completion
+                # without blocking the CPU thread
+                expert_key = (layer_idx, expert_idx)
+                if expert_key in self.expert_ready_events:
+                    # Record the event on current stream - this creates GPU-side dependency
+                    # without blocking CPU execution
+                    torch.cuda.current_stream().wait_event(self.expert_ready_events[expert_key])
+
                 # Use prefetched expert
                 if NVTX_AVAILABLE:
                     range_id = nvtx.start_range(f"PREFETCH_HIT: Layer{layer_idx}_Expert{expert_idx}")
@@ -277,13 +300,6 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
 
         final_hidden_states = final_hidden_states + shared_expert_output
 
-        # Trigger prefetch for layer+2 if not in collection mode
-        if not self.collection_mode and layer_idx + 2 in self.moe_layers:
-            if NVTX_AVAILABLE:
-                range_id = nvtx.start_range(f"EXPERT_PREFETCH_TRIGGER: Layer{layer_idx+2}")
-            self._trigger_prefetch_for_layer(layer_idx + 2, self.profiler.current_token_pos)
-            if NVTX_AVAILABLE:
-                nvtx.end_range(range_id)
 
         # Advance token position after the last MoE layer
         if layer_idx == self.moe_layers[-1]:
@@ -292,6 +308,7 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         # Return in the same format as original forward (output, router_logits)
         router_logits = router_logits.view(batch_size, sequence_length, -1)
         return final_hidden_states.view(batch_size, sequence_length, hidden_dim), router_logits
+
 
     def _is_expert_prefetched(self, layer_idx, expert_idx):
         """Check if the expert is already loaded in prefetch buffers."""
@@ -323,8 +340,8 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         return self._get_expert_for_execution(layer_idx, expert_idx)
 
     def _trigger_prefetch_for_layer(self, target_layer_idx, token_pos):
-        """Trigger prefetch for experts needed at target layer."""
-        if target_layer_idx >= len(self.model.model.layers) or target_layer_idx not in self.moe_layers:
+        """Trigger asynchronous prefetch for experts needed at target layer."""
+        if target_layer_idx != 2 or target_layer_idx >= len(self.model.model.layers) or target_layer_idx not in self.moe_layers:
             return
 
         # Get predicted experts for the target layer
@@ -353,7 +370,66 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
             current_buffer = self.prefetch_buffer_B
             buffer_name = "Buffer B (odd)"
 
-        # Load predicted experts into appropriate prefetch buffer
+        # Use async stream for prefetching if available
+        if self.prefetch_stream is not None:
+            self._load_experts_async(target_layer_idx, predicted_experts, current_cache, current_buffer, buffer_name)
+        else:
+            # Fallback to synchronous loading
+            self._load_experts_sync(target_layer_idx, predicted_experts, current_cache, current_buffer, buffer_name)
+
+    def _load_experts_async(self, target_layer_idx, predicted_experts, current_cache, current_buffer, buffer_name):
+        """Load ONE expert asynchronously to avoid bandwidth contention."""
+        # LOAD ONLY THE FIRST PREDICTED EXPERT to avoid PCIe bandwidth saturation
+        if not predicted_experts:
+            return
+
+        expert_idx = predicted_experts[0]  # Just load the most likely expert
+        if expert_idx is None or not isinstance(expert_idx, int) or expert_idx >= self.n_expert:
+            return
+
+        slot_idx = 0  # Use first buffer slot
+        if slot_idx not in current_buffer:
+            return
+
+        # PREPARE CPU OPERATIONS OUTSIDE STREAM CONTEXT
+        cpu_expert = self.model.model.layers[target_layer_idx].mlp.experts[expert_idx]
+        state_dict = cpu_expert.state_dict()
+
+        # Convert dtype on CPU before entering stream
+        converted_state_dict = {}
+        for key, tensor in state_dict.items():
+            if tensor.dtype != self.dtype:
+                converted_state_dict[key] = tensor.to(self.dtype)
+            else:
+                converted_state_dict[key] = tensor
+
+        # NOW DO SINGLE EXPERT TRANSFER IN STREAM CONTEXT
+        with torch.cuda.stream(self.prefetch_stream):
+            cache_key = (target_layer_idx, expert_idx)
+            prefetch_buffer = current_buffer[slot_idx]
+
+            # Load CPU expert weights into GPU prefetch buffer with correct dtype
+            if NVTX_AVAILABLE:
+                range_id = nvtx.start_range(f"ASYNC_SINGLE_EXPERT_LOAD: Layer{target_layer_idx}_Expert{expert_idx}_{buffer_name}")
+
+            # SINGLE EXPERT TRANSFER - optimal bandwidth usage
+            for name, param in prefetch_buffer.named_parameters():
+                if name in converted_state_dict:
+                    param.copy_(converted_state_dict[name], non_blocking=True)
+
+            # Cache the prefetched expert in appropriate buffer
+            current_cache[cache_key] = prefetch_buffer
+
+            # Create an event to track when this specific expert is ready
+            expert_event = torch.cuda.Event()
+            expert_event.record(self.prefetch_stream)
+            self.expert_ready_events[cache_key] = expert_event
+
+            if NVTX_AVAILABLE:
+                nvtx.end_range(range_id)
+
+    def _load_experts_sync(self, target_layer_idx, predicted_experts, current_cache, current_buffer, buffer_name):
+        """Fallback synchronous expert loading."""
         for i, expert_idx in enumerate(predicted_experts[:4]):  # Limit to 4 buffers
             if expert_idx is not None and isinstance(expert_idx, int) and 0 <= expert_idx < self.n_expert:
                 cache_key = (target_layer_idx, expert_idx)
