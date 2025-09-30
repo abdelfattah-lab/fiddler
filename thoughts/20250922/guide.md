@@ -4,9 +4,94 @@
 
 Always update guide.md to prepare it for another agent to look at it and understand the full state of the system and keep it concise. At the end of that, add all files changed (that are relevant) including guide.md to git and suggest a commit message but let me do the git commit.
 
+
+## Goal
+
+Apply the 
+
 ## Guide
 
-parallel_memory_compute_fixed.py works and has memory and compute running in parallel. Unlike src/fiddler/qwen_with_prefetch.py which fails to show the same behavior when vieweing the Nvidia Nsight Sys report in the GUI. Analyze both programs and make a plan of how to change qwen_with_prefetch to make sure memory transfer is parallel with computation.
+**STATUS**: ✅ Analysis complete - Root cause identified and fix plan created
+
+### 🔍 Analysis: Why parallel_memory_compute_fixed.py works but qwen_with_prefetch.py doesn't
+
+**parallel_memory_compute_fixed.py (✅ WORKS - shows parallel memory/compute in Nsight):**
+1. **Dedicated separate streams**: `transfer_stream` for memory, `compute_stream` for computation - complete isolation
+2. **Minimal sync points**: Only synchronizes transfer completion before compute launch, never forces compute stream to wait
+3. **Clean pattern**: H2D on transfer_stream → wait for transfer event → launch kernel on compute_stream → D2H on compute_stream
+4. **No stream context manager**: Uses explicit `.copy_to_device(stream=...)` and kernel launch with stream parameter
+5. **All CPU work outside streams**: Host array slicing and setup done before any async operations
+
+**qwen_with_prefetch.py (❌ DOESN'T WORK - no parallelism visible):**
+1. **Stream context overhead**: Uses `with torch.cuda.stream(self.prefetch_stream):` which creates implicit synchronization
+2. **Main stream blocking**: `torch.cuda.current_stream().wait_event()` at line 257 forces main computation to wait for prefetch
+3. **CPU ops inside stream context**: State dict preparation happens inside stream context causing hidden syncs
+4. **Wrong timing**: Prefetch triggered in middle of expert loop (line 230) instead of at layer start
+5. **Event-based waiting**: Making main stream wait defeats the entire purpose of async prefetch
+
+### 🎯 Fix Plan for qwen_with_prefetch.py
+
+**Goal**: Achieve true parallel memory transfer + computation like parallel_memory_compute_fixed.py
+
+**Key Changes Required**:
+
+1. **Remove `with torch.cuda.stream()` context manager** (line 407):
+   - Context manager creates synchronization barriers
+   - Use explicit stream arguments instead: `tensor.to(device, non_blocking=True)` with event recording
+
+2. **Remove main stream event wait** (line 257):
+   - `torch.cuda.current_stream().wait_event()` forces compute to wait for memory
+   - This is the PRIMARY CAUSE of no parallelism
+   - Only synchronize if expert is not ready when actually accessed
+
+3. **Move all CPU operations outside stream context**:
+   - State dict loading (line 396-404) should be completely outside any stream operations
+   - Only GPU operations should interact with streams
+
+4. **Trigger prefetch at layer START, not in middle of expert loop**:
+   - Current: Line 230 triggers in middle of expert processing
+   - Fix: Trigger at very beginning of `_moe_forward_with_management` before any expert execution
+   - Maximizes overlap opportunity between prefetch and current layer's computation
+
+5. **Use explicit non-blocking copies without stream context**:
+   ```python
+   # Instead of:
+   with torch.cuda.stream(self.prefetch_stream):
+       param.copy_(tensor, non_blocking=True)
+
+   # Do:
+   # Prepare everything on CPU first
+   target_device_tensor = cpu_tensor.to(device, non_blocking=True)
+   # Then record completion event on prefetch stream
+   event = torch.cuda.Event()
+   event.record(self.prefetch_stream)
+   ```
+
+6. **Implement proper async pattern**:
+   - Prefetch should run completely asynchronously
+   - Main computation should never wait unless expert is actually needed AND not ready
+   - Use events only for safety checks, not forced synchronization
+
+### 📋 Implementation Steps
+
+1. Refactor `_load_experts_async()` method (line 380):
+   - Remove `with torch.cuda.stream()` wrapper
+   - Move state dict conversion completely outside
+   - Use `.to(device, non_blocking=True)` for async transfer
+   - Record event only for completion tracking
+
+2. Refactor `_moe_forward_with_management()` method (line 186):
+   - Move prefetch trigger to line ~189 (after router computation, before expert loop)
+   - Remove event wait at line 257 completely
+   - Let prefetch and computation run truly parallel
+
+3. Add conditional sync only when needed:
+   - Check if expert is ready before using: `if not event.query(): event.synchronize()`
+   - This is a fallback safety check, not forced waiting
+
+### ⚠️ Critical Insight
+
+The fundamental issue is **forced synchronization** where qwen_with_prefetch makes the main computation stream wait for prefetch completion. The working code never does this - it lets memory and compute run in parallel on separate streams with minimal coordination.
 
 
 ## ❌ ASYNC PREFETCHING INVESTIGATION COMPLETED - ROOT CAUSE IDENTIFIED
