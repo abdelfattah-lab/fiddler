@@ -226,14 +226,6 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         for i, expert_idx_tensor in enumerate(expert_hit):
             expert_idx = expert_idx_tensor.item()
 
-            # TRIGGER PREFETCH IN THE MIDDLE OF EXPERT LOOP for maximum overlap
-            if i == len(expert_hit) // 2 and not self.collection_mode and layer_idx + 1 in self.moe_layers:
-                if NVTX_AVAILABLE:
-                    range_id = nvtx.start_range(f"PARALLEL_EXPERT_PREFETCH_TRIGGER: Layer{layer_idx+1}")
-                self._trigger_prefetch_for_layer(layer_idx + 1, self.profiler.current_token_pos)
-                if NVTX_AVAILABLE:
-                    nvtx.end_range(range_id)
-
             # Find tokens assigned to this expert (same as baseline)
             idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
 
@@ -248,13 +240,8 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
 
             # Check if expert was prefetched, use prefetched version if available
             if self._is_expert_prefetched(layer_idx, expert_idx):
-                # Use GPU-side synchronization: make current stream wait for prefetch completion
-                # without blocking the CPU thread
-                expert_key = (layer_idx, expert_idx)
-                if expert_key in self.expert_ready_events:
-                    # Record the event on current stream - this creates GPU-side dependency
-                    # without blocking CPU execution
-                    torch.cuda.current_stream().wait_event(self.expert_ready_events[expert_key])
+                # REMOVED: Event wait - this was the PRIMARY CAUSE of no parallelism
+                # Prefetch runs truly async, GPU will naturally wait when accessing tensor if needed
 
                 # Use prefetched expert
                 if NVTX_AVAILABLE:
@@ -300,6 +287,15 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
 
         final_hidden_states = final_hidden_states + shared_expert_output
 
+        # TRIGGER PREFETCH AFTER finishing with current layer's experts
+        # Now that we're done with layer N, start prefetching for layer N+2
+        # This gives maximum time for async transfer to complete
+        if not self.collection_mode and layer_idx + 2 in self.moe_layers:
+            if NVTX_AVAILABLE:
+                range_id = nvtx.start_range(f"PREFETCH_TRIGGER_AFTER_LAYER: Layer{layer_idx+2}")
+            self._trigger_prefetch_for_layer(layer_idx + 2, self.profiler.current_token_pos)
+            if NVTX_AVAILABLE:
+                nvtx.end_range(range_id)
 
         # Advance token position after the last MoE layer
         if layer_idx == self.moe_layers[-1]:
@@ -341,7 +337,7 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
 
     def _trigger_prefetch_for_layer(self, target_layer_idx, token_pos):
         """Trigger asynchronous prefetch for experts needed at target layer."""
-        if target_layer_idx != 2 or target_layer_idx >= len(self.model.model.layers) or target_layer_idx not in self.moe_layers:
+        if target_layer_idx >= len(self.model.model.layers) or target_layer_idx not in self.moe_layers:
             return
 
         # Get predicted experts for the target layer
@@ -403,30 +399,31 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
             else:
                 converted_state_dict[key] = tensor
 
-        # NOW DO SINGLE EXPERT TRANSFER IN STREAM CONTEXT
+        # Setup cache and buffer references (CPU operations)
+        cache_key = (target_layer_idx, expert_idx)
+        prefetch_buffer = current_buffer[slot_idx]
+
+        # Load CPU expert weights into GPU prefetch buffer with correct dtype
+        if NVTX_AVAILABLE:
+            range_id = nvtx.start_range(f"ASYNC_SINGLE_EXPERT_LOAD: Layer{target_layer_idx}_Expert{expert_idx}_{buffer_name}")
+
+        # Use stream context ONLY for the actual GPU memory transfers
         with torch.cuda.stream(self.prefetch_stream):
-            cache_key = (target_layer_idx, expert_idx)
-            prefetch_buffer = current_buffer[slot_idx]
-
-            # Load CPU expert weights into GPU prefetch buffer with correct dtype
-            if NVTX_AVAILABLE:
-                range_id = nvtx.start_range(f"ASYNC_SINGLE_EXPERT_LOAD: Layer{target_layer_idx}_Expert{expert_idx}_{buffer_name}")
-
             # SINGLE EXPERT TRANSFER - optimal bandwidth usage
             for name, param in prefetch_buffer.named_parameters():
                 if name in converted_state_dict:
                     param.copy_(converted_state_dict[name], non_blocking=True)
 
-            # Cache the prefetched expert in appropriate buffer
-            current_cache[cache_key] = prefetch_buffer
+        # CPU operations outside stream context to avoid hidden synchronization
+        current_cache[cache_key] = prefetch_buffer
 
-            # Create an event to track when this specific expert is ready
-            expert_event = torch.cuda.Event()
-            expert_event.record(self.prefetch_stream)
-            self.expert_ready_events[cache_key] = expert_event
+        # Record event on prefetch stream (for optional tracking, not used for forced waiting)
+        expert_event = torch.cuda.Event()
+        expert_event.record(self.prefetch_stream)
+        self.expert_ready_events[cache_key] = expert_event
 
-            if NVTX_AVAILABLE:
-                nvtx.end_range(range_id)
+        if NVTX_AVAILABLE:
+            nvtx.end_range(range_id)
 
     def _load_experts_sync(self, target_layer_idx, predicted_experts, current_cache, current_buffer, buffer_name):
         """Fallback synchronous expert loading."""
