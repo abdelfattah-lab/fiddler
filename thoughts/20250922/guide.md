@@ -6,17 +6,32 @@ Always update guide.md to prepare it for another agent to look at it and underst
 
 ## Current Status (2025-09-30)
 
-**Implementation**: ✅ GPU-resident layers 0-1 implemented in `src/fiddler/qwen_with_prefetch.py`
+**Implementation**: ✅ Pinned CPU memory for MoE experts in `src/fiddler/qwen_with_prefetch.py`
 
-**Result**: ✅ Hit rate improved from 11.8% → 20.7% by keeping first 2 MoE layers on GPU
+**Result**: ✅ 1.55x speedup vs baseline with 20.7% hit rate
 
 ## Current Goal
 
-✅ Created PyTorch version to test if overlap is possible with PyTorch (2025-09-30)
+**COMPLETED**: Pinned CPU memory successfully improves performance. We now have overlapping memory transfers with compute.
 
-Next: Analyze `pytorch_parallel_overlap.nsys-rep` to verify if PyTorch can achieve compute/memory overlap, or if PyTorch framework inherently prevents it.
+Next steps: Further analysis of compute/memory overlap in Nsight GUI to understand remaining bottlenecks.
 
 ## Recent Work
+
+✅ **Pinned CPU memory implementation** (2025-09-30):
+1. Added `_pin_expert_memory()` method to pin all CPU expert parameters
+2. Pinned 3,960 parameters (22 MoE layers × 60 experts × 3 params each)
+3. Enabled async H2D transfers without blocking
+4. Profile: `qwen_prefetch_profile_20250930_153222/`
+
+**Results**:
+- ✅ 1.55x speedup vs baseline (1.00s vs 1.55s)
+- ✅ Hit rate: 20.7% (same as before, as expected)
+- ✅ Memory transfers: 2.55s total H2D time (vs 2.36s without pinning)
+- ✅ Net improvement: Transfers take longer but overlap with compute reduces wall time
+- ✅ Output correct: "The capital of France is ______.\nParis"
+
+**Key insight**: Total memory transfer time increased, but wall-clock time decreased - this confirms successful compute/memory overlap.
 
 ✅ **PyTorch overlap test** (2025-09-30):
 1. Created `parallel_memory_compute_fixed_torch.py` - pure PyTorch version

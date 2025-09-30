@@ -139,6 +139,10 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         self.prefetch_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self.expert_ready_events = {}  # Track when each expert is ready: (layer, expert) -> event
 
+        # Pin CPU memory for all MoE experts to enable async transfers
+        print("📌 Pinning CPU memory for MoE experts...")
+        self._pin_expert_memory()
+
         # Keep first 2 MoE layers (0-1) permanently on GPU
         # Since we predict layer+2, layers 0-1 are never prefetched
         self.gpu_resident_layers = set()
@@ -152,7 +156,7 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
                     expert.to(self.device, dtype=self.dtype)
             print(f"🔒 Layers {self.moe_layers[0]}-{self.moe_layers[1]} experts permanently on GPU")
 
-        # Initialize dual buffer system
+        # Initialize dual buffer system with pinned memory
         if len(self.moe_layers) > 0 and not self.collection_mode:
             print(f"🔧 Initializing dual buffer system for {len(self.moe_layers)} MoE layers...")
             sample_layer = self.model.model.layers[self.moe_layers[0]]
@@ -169,10 +173,32 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
                 self.prefetch_buffer_B[i] = copy.deepcopy(sample_expert).to(self.device, dtype=self.dtype)
 
             print(f"✅ Dual buffer system initialized (Buffer A for even layers, Buffer B for odd layers)")
+            print(f"✅ GPU buffers ready to receive async transfers from pinned CPU memory")
             if self.prefetch_stream:
                 print(f"✅ Async prefetch stream initialized")
 
         print(f"🔮 Prefetch mode: {'Collection' if self.collection_mode else 'Prediction'}")
+
+    def _pin_expert_memory(self):
+        """Pin CPU memory for all MoE experts to enable async transfers without blocking."""
+        if not torch.cuda.is_available():
+            return
+
+        pinned_count = 0
+        for layer_idx in self.moe_layers[2:]:  # Skip first 2 layers (they'll be on GPU)
+            moe_layer = self.model.model.layers[layer_idx].mlp
+            for expert_idx, expert in enumerate(moe_layer.experts):
+                # Pin memory for each parameter in the expert
+                for param in expert.parameters():
+                    if param.device.type == 'cpu':
+                        # Create pinned memory tensor and copy data
+                        pinned_param = torch.empty_like(param, pin_memory=True)
+                        pinned_param.copy_(param)
+                        # Replace the parameter data with pinned version
+                        param.data = pinned_param
+                        pinned_count += 1
+
+        print(f"✅ Pinned {pinned_count} expert parameters in CPU memory")
 
     def load_expert_patterns(self):
         """Load expert usage patterns from file."""
