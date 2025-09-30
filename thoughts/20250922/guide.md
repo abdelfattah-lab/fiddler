@@ -1,5 +1,17 @@
 # Fiddler MoE Optimization Project - Agent Guide
 
+## Quick Summary
+
+**Project**: Optimize MoE (Mixture of Experts) inference by prefetching experts from CPU to GPU
+**Model**: Qwen2.5-7B-Instruct (24 MoE layers, 60 experts per layer)
+**Current Achievement**: 3.21x speedup vs pinned baseline using 7-expert prefetching (0.679s vs 2.182s)
+
+**Key Implementations**:
+- `src/fiddler/qwen.py` - Baseline with on-demand CPU→GPU expert loading (pinned memory)
+- `src/fiddler/qwen_with_prefetch.py` - Prefetch system with configurable expert count (0-16)
+
+**Next Step**: Compare prefetch vs CPU execution across different batch sizes to find optimal strategy
+
 ## Guidelines
 
 Always update guide.md to prepare it for another agent to look at it and understand the full state of the system and keep it concise. At the end of that, add all files changed (that are relevant) including guide.md to git and suggest a commit message but let me do the git commit.
@@ -7,10 +19,22 @@ Always update guide.md to prepare it for another agent to look at it and underst
 
 ## Current Goal
 
+**Objective**: Evaluate prefetch system vs Fiddler CPU fallback across different batch sizes
+
+**Tasks**:
+1. Enable Fiddler mode (CPU execution for small batches) in both baseline and prefetch implementations
+2. Create benchmark script that tests multiple batch sizes (1, 2, 4, 8, 16, 32, 64)
+3. For each batch size, compare:
+   - Baseline FiddlerQwen with CPU fallback
+   - FiddlerQwenWithPrefetch (optimal 7-expert config) with CPU fallback
+4. Identify crossover points where prefetching becomes beneficial vs CPU execution
+5. Generate plots showing speedup vs batch size for both strategies
+
+**Context**: Current benchmarks use batch size 1. Fiddler's insight is that small batches run faster on CPU. We need to understand when GPU prefetching beats CPU execution across different workload sizes.
+
+## Previous Goals
+
 ✅ **COMPLETED** - Added pinned memory to baseline Qwen for fair comparison
-
-## Previous Goal
-
 ✅ **COMPLETED** - Added configurable prefetch system with benchmark script
 
 ## Current Status (2025-09-30 - Pinned Memory Baseline)
