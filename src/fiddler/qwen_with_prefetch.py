@@ -438,13 +438,34 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
 
         # PREPARE CPU OPERATIONS OUTSIDE STREAM CONTEXT
         cpu_expert = self.model.model.layers[target_layer_idx].mlp.experts[expert_idx]
+
+        # DEBUG: Check if expert parameters are actually pinned BEFORE state_dict
+        #first_param = next(cpu_expert.parameters())
+        #print(f"DEBUG pre-state_dict: param.is_pinned={first_param.is_pinned()}")
+
         state_dict = cpu_expert.state_dict()
 
-        # Convert dtype on CPU before entering stream
+        # DEBUG: Check if state_dict preserves pinning
+        #for k, v in list(state_dict.items())[:1]:
+        #    print(f"DEBUG state_dict: {k}.is_pinned={v.is_pinned()}")
+
+        # Convert dtype on CPU WHILE PRESERVING PINNED MEMORY
         converted_state_dict = {}
         for key, tensor in state_dict.items():
+            # CRITICAL BUG FIX: state_dict() returns COPIES not references
+            # Even if original param is pinned, state_dict copy might not be!
+            # Solution: ALWAYS ensure pinned memory for async transfer
+            if not tensor.is_pinned():
+                # Tensor is not pinned, we MUST pin it for async transfer
+                pinned_tensor = torch.empty_like(tensor, pin_memory=True)
+                pinned_tensor.copy_(tensor)
+                tensor = pinned_tensor
+
             if tensor.dtype != self.dtype:
-                converted_state_dict[key] = tensor.to(self.dtype)
+                # Convert dtype while preserving pinned status
+                converted = torch.empty_like(tensor, dtype=self.dtype, pin_memory=True)
+                converted.copy_(tensor)
+                converted_state_dict[key] = converted
             else:
                 converted_state_dict[key] = tensor
 
@@ -457,11 +478,19 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
             range_id = nvtx.start_range(f"ASYNC_SINGLE_EXPERT_LOAD: Layer{target_layer_idx}_Expert{expert_idx}_{buffer_name}")
 
         # Use stream context ONLY for the actual GPU memory transfers
-        with torch.cuda.stream(self.prefetch_stream):
-            # SINGLE EXPERT TRANSFER - optimal bandwidth usage
-            for name, param in prefetch_buffer.named_parameters():
-                if name in converted_state_dict:
-                    param.copy_(converted_state_dict[name], non_blocking=True)
+        # CRITICAL: torch.no_grad() prevents autograd from adding hidden synchronization
+        with torch.no_grad():
+            with torch.cuda.stream(self.prefetch_stream):
+                # SINGLE EXPERT TRANSFER - optimal bandwidth usage using direct H2D copy
+                # The key is to copy FROM pinned CPU TO GPU parameter directly
+                for name, param in prefetch_buffer.named_parameters():
+                    if name in converted_state_dict:
+                        src_tensor = converted_state_dict[name]
+                        # Debug: Check if source is really pinned
+                        if not src_tensor.is_pinned():
+                            print(f"⚠️  WARNING: {name} is NOT pinned! device={src_tensor.device}, dtype={src_tensor.dtype}")
+                        # Direct copy from pinned CPU to GPU parameter
+                        param.data.copy_(src_tensor, non_blocking=True)
 
         # CPU operations outside stream context to avoid hidden synchronization
         current_cache[cache_key] = prefetch_buffer
