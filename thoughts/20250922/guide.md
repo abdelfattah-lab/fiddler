@@ -7,18 +7,44 @@ Always update guide.md to prepare it for another agent to look at it and underst
 
 ## Current Goal
 
+✅ **COMPLETED** - Added pinned memory to baseline Qwen for fair comparison
+
+## Previous Goal
+
 ✅ **COMPLETED** - Added configurable prefetch system with benchmark script
 
-## Current Status (2025-09-30 - Configurable Prefetch)
+## Current Status (2025-09-30 - Pinned Memory Baseline)
 
-**New Feature**: ✅ Configurable prefetch with benchmark automation
+**New Feature**: ✅ Added pinned memory to baseline FiddlerQwen
+
+**Key Achievement**: **1.33x speedup** from pinned memory alone (2.908s → 2.182s)
+
+**Implementation**:
+- Pinned all CPU expert parameters in `_pin_cpu_experts()` (4,320 parameters)
+- Updated `_get_expert_for_execution()` to ensure pinned memory during state_dict transfers
+- Same fix as prefetch: force re-pinning of state_dict() copies before GPU transfer
+
+**Results**:
+- Baseline without pinned: 2.908s (previous benchmark)
+- Baseline with pinned: 2.182s (current benchmark)
+- Speedup: **1.33x** (33.3% faster)
+- Plot: `pinned_baseline_benchmark_20250930_185406/pinned_memory_speedup.png`
+
+**Updated Prefetch Speedup** (vs new pinned baseline):
+- Previous: 4.285x vs 2.908s baseline = 0.679s
+- New: 0.679s / 2.182s = **3.21x vs pinned baseline** (still significant!)
+- This shows prefetch provides 3.21x speedup beyond what pinned memory alone achieves
+
+## Previous Status (2025-09-30 - Configurable Prefetch)
+
+**Feature**: ✅ Configurable prefetch with benchmark automation
 
 **Implementation**:
 - Added `num_experts_to_prefetch` parameter (0-16) to FiddlerQwenWithPrefetch
 - Dynamic buffer allocation based on configuration
 - Benchmark script tests all configurations and plots results
 
-**Previous Achievement**: ✅ 1.28x speedup vs baseline with 20.7% hit rate (single expert prefetch)
+**Achievement**: ✅ 4.285x speedup vs old baseline (2.908s → 0.679s) with 52.1% hit rate (7 experts)
 
 **Key Achievement**: Successfully enabled pinned memory transfers using async CUDA streams
 
@@ -49,6 +75,22 @@ Always update guide.md to prepare it for another agent to look at it and underst
    ```
 
 **Purpose**: Systematically explore the prefetch configuration space to find optimal number of experts to prefetch per layer, balancing hit rate vs memory bandwidth.
+
+**Benchmark Results** (from latest run):
+- **Baseline**: 2.908s
+- **Best configuration**: 7 experts → **4.285x speedup** (0.679s, 52.1% hit rate)
+- Top 5 configurations:
+  1. 7 experts: 4.285x speedup (52.1% hit rate)
+  2. 4 experts: 4.263x speedup (42.6% hit rate)
+  3. 5 experts: 4.257x speedup (45.5% hit rate)
+  4. 9 experts: 4.255x speedup (57.5% hit rate)
+  5. 6 experts: 4.247x speedup (48.6% hit rate)
+
+**Key Findings**:
+- Sweet spot around 4-9 experts per layer
+- 7 experts provides best balance of hit rate and performance
+- Beyond 10 experts, performance slightly degrades (diminishing returns)
+- Results saved to: `prefetch_benchmark_20250930_174024/`
 
 ## Previous Work (2025-09-30)
 
@@ -142,18 +184,82 @@ python benchmark_prefetch_configs.py
 ```
 
 ### Profiling with Nsight Systems
+
+#### Quick Profile of Best Configuration (7 experts)
 ```bash
-# Generate profiles (collection + prediction modes)
-python profile_qwen_prefetch.py
+# Profile the optimal configuration (4.285x speedup)
+timestamp=$(date +%Y%m%d_%H%M%S)
+profile_dir="qwen_7experts_profile_${timestamp}"
+mkdir -p "${profile_dir}"
 
-# View in GUI
-nsight-sys qwen_prefetch_profile_*/qwen_prefetch_collection.nsys-rep
-nsight-sys qwen_prefetch_profile_*/qwen_prefetch_prediction.nsys-rep
+nsys profile \
+  --output="${profile_dir}/qwen_7experts" \
+  --force-overwrite=true \
+  --trace=cuda,nvtx,osrt \
+  --cuda-memory-usage=true \
+  --sample=none \
+  python profile_7_experts.py
 
-# CLI analysis
-nsys stats --report cuda_gpu_mem_time_sum <profile.nsys-rep>
-nsys stats --report nvtx_sum <profile.nsys-rep>
+# Profile saved to: ${profile_dir}/qwen_7experts.nsys-rep
 ```
+
+#### Profile Any Configuration
+```bash
+# Create a custom profiling script
+# Set num_experts_to_prefetch to desired value (0-16)
+
+timestamp=$(date +%Y%m%d_%H%M%S)
+profile_dir="qwen_Nexperts_profile_${timestamp}"
+mkdir -p "${profile_dir}"
+
+nsys profile \
+  --output="${profile_dir}/qwen_profile" \
+  --force-overwrite=true \
+  --trace=cuda,nvtx,osrt \
+  --cuda-memory-usage=true \
+  --sample=none \
+  python <your_script.py>
+
+# Replace <your_script.py> with script that instantiates:
+# model = FiddlerQwenWithPrefetch(args, num_experts_to_prefetch=N)
+```
+
+#### View Profiles
+
+**GUI (Recommended)**:
+```bash
+# View in Nsight Systems GUI
+nsight-sys qwen_7experts_profile_*/qwen_7experts.nsys-rep
+
+# Or use full path
+nsight-sys /home/afa55/Projects/fiddler/qwen_7experts_profile_20250930_181810/qwen_7experts.nsys-rep
+```
+
+**CLI Analysis**:
+```bash
+# Memory transfer statistics
+nsys stats --report cuda_gpu_mem_time_sum <profile.nsys-rep>
+
+# NVTX marker statistics (shows prefetch hits/misses)
+nsys stats --report nvtx_sum <profile.nsys-rep>
+
+# CUDA kernel statistics
+nsys stats --report cuda_gpu_kern_sum <profile.nsys-rep>
+
+# Filter for specific markers
+nsys stats --report nvtx_sum <profile.nsys-rep> | grep "ASYNC_EXPERT_LOAD"
+nsys stats --report nvtx_sum <profile.nsys-rep> | grep "EXPERT_LOAD_ON_DEMAND"
+nsys stats --report nvtx_sum <profile.nsys-rep> | grep "PREFETCH_HIT"
+```
+
+#### Profile Locations
+All profiles are saved to directories with pattern:
+- `qwen_7experts_profile_<timestamp>/` - 7-expert configuration profiles
+- `qwen_prefetch_profile_<timestamp>/` - General prefetch profiles
+- Each directory contains:
+  - `*.nsys-rep` - Main Nsight Systems report file
+  - `*.sqlite` - SQLite database (auto-generated from .nsys-rep)
+  - `PROFILE_SUMMARY.md` - Human-readable summary (if created)
 
 ### NVTX Markers (visible in Nsight GUI)
 - `PREFETCH_TRIGGER_AFTER_LAYER`: When prefetch is triggered for layer+2
@@ -180,22 +286,55 @@ Despite async implementation with separate CUDA stream:
 
 ## Files Changed
 
-### Modified:
+### Modified (Current Session):
+1. **src/fiddler/qwen.py**:
+   - Added `_pin_cpu_experts()` method (lines 138-155)
+   - Pins all CPU expert parameters for faster transfers (4,320 parameters)
+   - Updated `_get_expert_for_execution()` (lines 267-301)
+   - Force re-pinning of state_dict() copies before GPU transfer
+   - Ensures dtype conversion preserves pinned memory property
+
+2. **thoughts/20250922/guide.md**:
+   - Updated with pinned memory baseline results
+   - Added 1.33x speedup comparison
+   - Recalculated prefetch speedup vs new pinned baseline (3.21x)
+
+### Created (Current Session):
+1. **benchmark_pinned_baseline.py**:
+   - Benchmark script for pinned memory baseline
+   - Runs 5 iterations for stable measurements
+   - Saves results to JSON
+
+2. **plot_pinned_speedup.py**:
+   - Visualization script for pinned vs non-pinned comparison
+   - Generates bar charts showing 1.33x speedup
+
+3. **pinned_baseline_benchmark_20250930_185406/**:
+   - Benchmark results directory
+   - Contains benchmark_results.json
+   - Contains pinned_memory_speedup.png plot
+
+### Modified (Previous Session):
 1. **src/fiddler/qwen_with_prefetch.py**:
    - Added `num_experts_to_prefetch` parameter (lines 115-120)
    - Dynamic buffer allocation based on config (lines 163-186)
    - Updated async loading to load N experts (lines 431-500)
    - Updated sync loading to load N experts (lines 502-535)
 
-2. **thoughts/20250922/guide.md**:
-   - Updated with configurable prefetch feature
-   - Added benchmark script usage instructions
-
-### Created:
+### Created (Previous Session):
 1. **benchmark_prefetch_configs.py**:
    - Automated benchmark script for all prefetch configurations
    - Tests 0-16 experts prefetch settings
    - Generates performance plots and CSV results
+   - Found optimal configuration: 7 experts (4.285x speedup vs old baseline)
+
+2. **profile_7_experts.py**:
+   - Profiling script for optimal 7-expert configuration
+   - Used with Nsight Systems for detailed analysis
+
+3. **qwen_7experts_profile_20250930_181810/**:
+   - Nsight Systems profile of best configuration
+   - Contains .nsys-rep file and PROFILE_SUMMARY.md
 
 ### Created (diagnostics - can be deleted):
 - `diagnose_pinned_memory.py`
@@ -207,28 +346,39 @@ Despite async implementation with separate CUDA stream:
 ## Suggested Commit Message
 
 ```
-Add configurable prefetch system with benchmark automation
+Add pinned memory to baseline Qwen for fair comparison
 
-Added parameter to control number of experts prefetched per layer (0-16).
-This enables systematic exploration of the prefetch configuration space
-to find optimal balance between hit rate and memory bandwidth.
+Added pinned memory support to the baseline FiddlerQwen implementation
+to ensure fair comparison with the prefetch system. Pinned memory alone
+provides 1.33x speedup over regular memory transfers.
 
 Changes:
-- Added num_experts_to_prefetch parameter to FiddlerQwenWithPrefetch
-- Dynamic buffer allocation adapts to configuration
-- Updated async/sync loading to handle N experts
-- Created benchmark_prefetch_configs.py script that:
-  * Tests all configurations (0-16 experts)
-  * Compares against baseline
-  * Generates speedup and hit rate plots
-  * Saves CSV and JSON results
+- Added _pin_cpu_experts() method to pin all CPU expert parameters
+- Updated _get_expert_for_execution() to ensure pinned transfers:
+  * Force re-pinning of state_dict() copies (same fix as prefetch)
+  * Preserve pinned memory during dtype conversion
+  * Handle 4,320 expert parameters across 24 MoE layers
+- Created benchmark_pinned_baseline.py for performance measurement
+- Created plot_pinned_speedup.py for visualization
 
-Usage:
-  python benchmark_prefetch_configs.py
+Results:
+- Baseline without pinned: 2.908s (previous)
+- Baseline with pinned: 2.182s (current)
+- Speedup from pinned memory: 1.33x (33.3% faster)
+
+Updated prefetch speedup calculation:
+- Previous: 4.285x vs 2.908s baseline
+- Corrected: 3.21x vs 2.182s pinned baseline
+- Prefetch still provides significant speedup beyond pinned memory
+
+This establishes a fairer baseline for evaluating the prefetch system's
+contribution, as both implementations now use pinned memory for CPU-GPU
+transfers.
 
 Files changed:
-- src/fiddler/qwen_with_prefetch.py
-- benchmark_prefetch_configs.py (new)
+- src/fiddler/qwen.py
+- benchmark_pinned_baseline.py (new)
+- plot_pinned_speedup.py (new)
 - thoughts/20250922/guide.md
 ```
 

@@ -123,6 +123,9 @@ class FiddlerQwen:
             self.expert_buffer.to(self.device, dtype=self.dtype)
             print(f"Created GPU expert buffer on {self.device} with dtype {self.dtype}")
 
+            # Pin all CPU expert parameters for faster async transfers
+            self._pin_cpu_experts()
+
         # Statistics
         self.expert_fetch_count = 0
         self.expert_hit_count = 0
@@ -131,6 +134,25 @@ class FiddlerQwen:
         self.current_expert = None  # Track which expert is loaded in buffer
 
         print("✅ Expert management ready")
+
+    def _pin_cpu_experts(self):
+        """Pin all CPU expert parameters in memory for faster transfers."""
+        print("📌 Pinning CPU expert parameters...")
+        pinned_count = 0
+
+        for layer_idx in self.moe_layers:
+            layer = self.model.model.layers[layer_idx]
+            for expert_idx, expert in enumerate(layer.mlp.experts):
+                for param in expert.parameters():
+                    if param.device.type == 'cpu':
+                        # Create pinned memory tensor and copy data
+                        pinned_param = torch.empty_like(param, pin_memory=True)
+                        pinned_param.copy_(param)
+                        # Replace the parameter data with pinned version
+                        param.data = pinned_param
+                        pinned_count += 1
+
+        print(f"✅ Pinned {pinned_count} expert parameters")
 
     def _hook_moe_layers(self):
         """Hook into MoE layers to add expert management."""
@@ -253,13 +275,27 @@ class FiddlerQwen:
             # Load expert from CPU to GPU buffer
             cpu_expert = self.model.model.layers[layer_idx].mlp.experts[expert_idx]
 
-            # Copy CPU expert weights to GPU buffer with correct dtype
+            # Copy CPU expert weights to GPU buffer with correct dtype and pinned memory
             state_dict = cpu_expert.state_dict()
-            # Ensure all weights are loaded with the correct dtype
+            converted_state_dict = {}
+
             for key, tensor in state_dict.items():
+                # CRITICAL: state_dict() returns copies that might not be pinned
+                # Always ensure pinned memory for transfers
+                if not tensor.is_pinned():
+                    pinned_tensor = torch.empty_like(tensor, pin_memory=True)
+                    pinned_tensor.copy_(tensor)
+                    tensor = pinned_tensor
+
                 if tensor.dtype != self.dtype:
-                    state_dict[key] = tensor.to(self.dtype)
-            self.expert_buffer.load_state_dict(state_dict)
+                    # Convert dtype while preserving pinned status
+                    converted = torch.empty_like(tensor, dtype=self.dtype, pin_memory=True)
+                    converted.copy_(tensor)
+                    converted_state_dict[key] = converted
+                else:
+                    converted_state_dict[key] = tensor
+
+            self.expert_buffer.load_state_dict(converted_state_dict)
             self.current_expert = expert_key
 
         return self.expert_buffer
