@@ -4,11 +4,21 @@
 
 Always update guide.md to prepare it for another agent to look at it and understand the full state of the system and keep it concise. At the end of that, add all files changed (that are relevant) including guide.md to git and suggest a commit message but let me do the git commit.
 
-## Current Status (2025-09-30 - FINAL)
 
-**Implementation**: ✅ Fixed pinned memory transfers for true async H2D copies
+## Current Goal
 
-**Result**: ✅ 1.28x speedup vs baseline with 20.7% hit rate
+✅ **COMPLETED** - Added configurable prefetch system with benchmark script
+
+## Current Status (2025-09-30 - Configurable Prefetch)
+
+**New Feature**: ✅ Configurable prefetch with benchmark automation
+
+**Implementation**:
+- Added `num_experts_to_prefetch` parameter (0-16) to FiddlerQwenWithPrefetch
+- Dynamic buffer allocation based on configuration
+- Benchmark script tests all configurations and plots results
+
+**Previous Achievement**: ✅ 1.28x speedup vs baseline with 20.7% hit rate (single expert prefetch)
 
 **Key Achievement**: Successfully enabled pinned memory transfers using async CUDA streams
 
@@ -24,6 +34,23 @@ Always update guide.md to prepare it for another agent to look at it and underst
 - 1.28x measured speedup confirms async benefit
 
 ## Recent Work (2025-09-30)
+
+✅ **Added configurable prefetch system** (2025-09-30):
+1. **Parameter**: Added `num_experts_to_prefetch` to control prefetch behavior (0-16 experts)
+2. **Dynamic buffers**: Buffer size now adapts to configuration (was fixed at 4)
+3. **Benchmark automation**: Created `benchmark_prefetch_configs.py` script that:
+   - Tests all configurations from 0 to 16 experts
+   - Runs baseline comparison
+   - Generates speedup and hit rate plots
+   - Saves results to CSV and JSON
+4. **Usage**: Model can now be instantiated with custom prefetch config:
+   ```python
+   model = FiddlerQwenWithPrefetch(args, num_experts_to_prefetch=4)
+   ```
+
+**Purpose**: Systematically explore the prefetch configuration space to find optimal number of experts to prefetch per layer, balancing hit rate vs memory bandwidth.
+
+## Previous Work (2025-09-30)
 
 ✅ **Fixed async pinned memory transfers**:
 1. **Problem**: Despite pinning parameters, Nsight showed "Pageable" transfers
@@ -105,6 +132,13 @@ python quick_test.py FiddlerQwen
 python quick_test.py FiddlerQwenWithPrefetch
 
 # Expected output: "The capital of France is ______.\nParis"
+
+# Run benchmark across all prefetch configurations (0-16 experts)
+python benchmark_prefetch_configs.py
+# Creates prefetch_benchmark_<timestamp>/ directory with:
+# - benchmark_results.csv (detailed results)
+# - benchmark_summary.json (summary stats)
+# - prefetch_speedup_analysis.png (speedup and hit rate plots)
 ```
 
 ### Profiling with Nsight Systems
@@ -147,11 +181,21 @@ Despite async implementation with separate CUDA stream:
 ## Files Changed
 
 ### Modified:
-1. **src/fiddler/qwen_with_prefetch.py** (lines 439-481):
-   - Fixed pinned memory being lost in `state_dict()` copies
-   - Added torch.no_grad() wrapper around async transfers
-   - Force re-pin all tensors from state_dict() before GPU transfer
-   - Preserve pinned property through dtype conversions
+1. **src/fiddler/qwen_with_prefetch.py**:
+   - Added `num_experts_to_prefetch` parameter (lines 115-120)
+   - Dynamic buffer allocation based on config (lines 163-186)
+   - Updated async loading to load N experts (lines 431-500)
+   - Updated sync loading to load N experts (lines 502-535)
+
+2. **thoughts/20250922/guide.md**:
+   - Updated with configurable prefetch feature
+   - Added benchmark script usage instructions
+
+### Created:
+1. **benchmark_prefetch_configs.py**:
+   - Automated benchmark script for all prefetch configurations
+   - Tests 0-16 experts prefetch settings
+   - Generates performance plots and CSV results
 
 ### Created (diagnostics - can be deleted):
 - `diagnose_pinned_memory.py`
@@ -163,23 +207,29 @@ Despite async implementation with separate CUDA stream:
 ## Suggested Commit Message
 
 ```
-Fix async pinned memory transfers for MoE expert loading
+Add configurable prefetch system with benchmark automation
 
-Root cause: PyTorch's state_dict() creates non-pinned copies even when
-original parameters are pinned. This caused all H2D transfers to use
-pageable memory, preventing true async overlap.
+Added parameter to control number of experts prefetched per layer (0-16).
+This enables systematic exploration of the prefetch configuration space
+to find optimal balance between hit rate and memory bandwidth.
 
-Solution:
-- Force re-pin all tensors from state_dict() before transfer
-- Wrap transfers in torch.no_grad() to prevent autograd sync
-- Preserve pinned memory through dtype conversions
+Changes:
+- Added num_experts_to_prefetch parameter to FiddlerQwenWithPrefetch
+- Dynamic buffer allocation adapts to configuration
+- Updated async/sync loading to handle N experts
+- Created benchmark_prefetch_configs.py script that:
+  * Tests all configurations (0-16 experts)
+  * Compares against baseline
+  * Generates speedup and hit rate plots
+  * Saves CSV and JSON results
 
-Results:
-- 1,533 pinned H2D transfers (was 0)
-- Async transfers on dedicated CUDA stream
-- 1.28x speedup vs baseline with 20.7% hit rate
+Usage:
+  python benchmark_prefetch_configs.py
 
-Files changed: src/fiddler/qwen_with_prefetch.py, thoughts/20250922/guide.md
+Files changed:
+- src/fiddler/qwen_with_prefetch.py
+- benchmark_prefetch_configs.py (new)
+- thoughts/20250922/guide.md
 ```
 
 ## Historical Notes

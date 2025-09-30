@@ -112,9 +112,12 @@ class PrefetchMetrics:
 class FiddlerQwenWithPrefetch(FiddlerQwen):
     """Qwen implementation with prefetch capabilities."""
 
-    def __init__(self, args):
+    def __init__(self, args, num_experts_to_prefetch=1):
         # Initialize base class
         super().__init__(args)
+
+        # Configure number of experts to prefetch per layer (0-16)
+        self.num_experts_to_prefetch = max(0, min(16, num_experts_to_prefetch))
 
         # Initialize prefetch components
         self.profiler = ExpertUsageProfiler(len(self.moe_layers), self.n_expert)
@@ -157,27 +160,30 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
             print(f"🔒 Layers {self.moe_layers[0]}-{self.moe_layers[1]} experts permanently on GPU")
 
         # Initialize dual buffer system with pinned memory
-        if len(self.moe_layers) > 0 and not self.collection_mode:
+        if len(self.moe_layers) > 0 and not self.collection_mode and self.num_experts_to_prefetch > 0:
             print(f"🔧 Initializing dual buffer system for {len(self.moe_layers)} MoE layers...")
             sample_layer = self.model.model.layers[self.moe_layers[0]]
             sample_expert = sample_layer.mlp.experts[0]
 
-            # Create Buffer A (4 expert slots for even layers)
+            # Create Buffer A (N expert slots for even layers)
             self.prefetch_buffer_A = {}
-            for i in range(4):
+            for i in range(self.num_experts_to_prefetch):
                 self.prefetch_buffer_A[i] = copy.deepcopy(sample_expert).to(self.device, dtype=self.dtype)
 
-            # Create Buffer B (4 expert slots for odd layers)
+            # Create Buffer B (N expert slots for odd layers)
             self.prefetch_buffer_B = {}
-            for i in range(4):
+            for i in range(self.num_experts_to_prefetch):
                 self.prefetch_buffer_B[i] = copy.deepcopy(sample_expert).to(self.device, dtype=self.dtype)
 
-            print(f"✅ Dual buffer system initialized (Buffer A for even layers, Buffer B for odd layers)")
+            print(f"✅ Dual buffer system initialized with {self.num_experts_to_prefetch} expert slots per buffer")
+            print(f"✅ Buffer A for even layers, Buffer B for odd layers")
             print(f"✅ GPU buffers ready to receive async transfers from pinned CPU memory")
             if self.prefetch_stream:
                 print(f"✅ Async prefetch stream initialized")
 
         print(f"🔮 Prefetch mode: {'Collection' if self.collection_mode else 'Prediction'}")
+        if not self.collection_mode:
+            print(f"🎯 Prefetching {self.num_experts_to_prefetch} expert(s) per layer")
 
     def _pin_expert_memory(self):
         """Pin CPU memory for all MoE experts to enable async transfers without blocking."""
@@ -423,89 +429,80 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
             self._load_experts_sync(target_layer_idx, predicted_experts, current_cache, current_buffer, buffer_name)
 
     def _load_experts_async(self, target_layer_idx, predicted_experts, current_cache, current_buffer, buffer_name):
-        """Load ONE expert asynchronously to avoid bandwidth contention."""
-        # LOAD ONLY THE FIRST PREDICTED EXPERT to avoid PCIe bandwidth saturation
+        """Load N experts asynchronously based on num_experts_to_prefetch configuration."""
         if not predicted_experts:
             return
 
-        expert_idx = predicted_experts[0]  # Just load the most likely expert
-        if expert_idx is None or not isinstance(expert_idx, int) or expert_idx >= self.n_expert:
-            return
+        # Load up to num_experts_to_prefetch experts
+        num_to_load = min(self.num_experts_to_prefetch, len(predicted_experts), len(current_buffer))
 
-        slot_idx = 0  # Use first buffer slot
-        if slot_idx not in current_buffer:
-            return
+        for slot_idx in range(num_to_load):
+            expert_idx = predicted_experts[slot_idx]
+            if expert_idx is None or not isinstance(expert_idx, int) or expert_idx >= self.n_expert:
+                continue
 
-        # PREPARE CPU OPERATIONS OUTSIDE STREAM CONTEXT
-        cpu_expert = self.model.model.layers[target_layer_idx].mlp.experts[expert_idx]
+            if slot_idx not in current_buffer:
+                continue
 
-        # DEBUG: Check if expert parameters are actually pinned BEFORE state_dict
-        #first_param = next(cpu_expert.parameters())
-        #print(f"DEBUG pre-state_dict: param.is_pinned={first_param.is_pinned()}")
+            # PREPARE CPU OPERATIONS OUTSIDE STREAM CONTEXT
+            cpu_expert = self.model.model.layers[target_layer_idx].mlp.experts[expert_idx]
 
-        state_dict = cpu_expert.state_dict()
+            state_dict = cpu_expert.state_dict()
 
-        # DEBUG: Check if state_dict preserves pinning
-        #for k, v in list(state_dict.items())[:1]:
-        #    print(f"DEBUG state_dict: {k}.is_pinned={v.is_pinned()}")
+            # Convert dtype on CPU WHILE PRESERVING PINNED MEMORY
+            converted_state_dict = {}
+            for key, tensor in state_dict.items():
+                # CRITICAL BUG FIX: state_dict() returns COPIES not references
+                # Even if original param is pinned, state_dict copy might not be!
+                # Solution: ALWAYS ensure pinned memory for async transfer
+                if not tensor.is_pinned():
+                    # Tensor is not pinned, we MUST pin it for async transfer
+                    pinned_tensor = torch.empty_like(tensor, pin_memory=True)
+                    pinned_tensor.copy_(tensor)
+                    tensor = pinned_tensor
 
-        # Convert dtype on CPU WHILE PRESERVING PINNED MEMORY
-        converted_state_dict = {}
-        for key, tensor in state_dict.items():
-            # CRITICAL BUG FIX: state_dict() returns COPIES not references
-            # Even if original param is pinned, state_dict copy might not be!
-            # Solution: ALWAYS ensure pinned memory for async transfer
-            if not tensor.is_pinned():
-                # Tensor is not pinned, we MUST pin it for async transfer
-                pinned_tensor = torch.empty_like(tensor, pin_memory=True)
-                pinned_tensor.copy_(tensor)
-                tensor = pinned_tensor
+                if tensor.dtype != self.dtype:
+                    # Convert dtype while preserving pinned status
+                    converted = torch.empty_like(tensor, dtype=self.dtype, pin_memory=True)
+                    converted.copy_(tensor)
+                    converted_state_dict[key] = converted
+                else:
+                    converted_state_dict[key] = tensor
 
-            if tensor.dtype != self.dtype:
-                # Convert dtype while preserving pinned status
-                converted = torch.empty_like(tensor, dtype=self.dtype, pin_memory=True)
-                converted.copy_(tensor)
-                converted_state_dict[key] = converted
-            else:
-                converted_state_dict[key] = tensor
+            # Setup cache and buffer references (CPU operations)
+            cache_key = (target_layer_idx, expert_idx)
+            prefetch_buffer = current_buffer[slot_idx]
 
-        # Setup cache and buffer references (CPU operations)
-        cache_key = (target_layer_idx, expert_idx)
-        prefetch_buffer = current_buffer[slot_idx]
+            # Load CPU expert weights into GPU prefetch buffer with correct dtype
+            if NVTX_AVAILABLE:
+                range_id = nvtx.start_range(f"ASYNC_EXPERT_LOAD: Layer{target_layer_idx}_Expert{expert_idx}_{buffer_name}_Slot{slot_idx}")
 
-        # Load CPU expert weights into GPU prefetch buffer with correct dtype
-        if NVTX_AVAILABLE:
-            range_id = nvtx.start_range(f"ASYNC_SINGLE_EXPERT_LOAD: Layer{target_layer_idx}_Expert{expert_idx}_{buffer_name}")
+            # Use stream context ONLY for the actual GPU memory transfers
+            # CRITICAL: torch.no_grad() prevents autograd from adding hidden synchronization
+            with torch.no_grad():
+                with torch.cuda.stream(self.prefetch_stream):
+                    # Expert transfer - using direct H2D copy from pinned CPU memory
+                    for name, param in prefetch_buffer.named_parameters():
+                        if name in converted_state_dict:
+                            src_tensor = converted_state_dict[name]
+                            # Direct copy from pinned CPU to GPU parameter
+                            param.data.copy_(src_tensor, non_blocking=True)
 
-        # Use stream context ONLY for the actual GPU memory transfers
-        # CRITICAL: torch.no_grad() prevents autograd from adding hidden synchronization
-        with torch.no_grad():
-            with torch.cuda.stream(self.prefetch_stream):
-                # SINGLE EXPERT TRANSFER - optimal bandwidth usage using direct H2D copy
-                # The key is to copy FROM pinned CPU TO GPU parameter directly
-                for name, param in prefetch_buffer.named_parameters():
-                    if name in converted_state_dict:
-                        src_tensor = converted_state_dict[name]
-                        # Debug: Check if source is really pinned
-                        if not src_tensor.is_pinned():
-                            print(f"⚠️  WARNING: {name} is NOT pinned! device={src_tensor.device}, dtype={src_tensor.dtype}")
-                        # Direct copy from pinned CPU to GPU parameter
-                        param.data.copy_(src_tensor, non_blocking=True)
+            # CPU operations outside stream context to avoid hidden synchronization
+            current_cache[cache_key] = prefetch_buffer
 
-        # CPU operations outside stream context to avoid hidden synchronization
-        current_cache[cache_key] = prefetch_buffer
+            # Record event on prefetch stream (for optional tracking, not used for forced waiting)
+            expert_event = torch.cuda.Event()
+            expert_event.record(self.prefetch_stream)
+            self.expert_ready_events[cache_key] = expert_event
 
-        # Record event on prefetch stream (for optional tracking, not used for forced waiting)
-        expert_event = torch.cuda.Event()
-        expert_event.record(self.prefetch_stream)
-        self.expert_ready_events[cache_key] = expert_event
-
-        if NVTX_AVAILABLE:
-            nvtx.end_range(range_id)
+            if NVTX_AVAILABLE:
+                nvtx.end_range(range_id)
 
     def _load_experts_sync(self, target_layer_idx, predicted_experts, current_cache, current_buffer, buffer_name):
         """Fallback synchronous expert loading."""
-        for i, expert_idx in enumerate(predicted_experts[:4]):  # Limit to 4 buffers
+        num_to_load = min(self.num_experts_to_prefetch, len(predicted_experts))
+        for i, expert_idx in enumerate(predicted_experts[:num_to_load]):
             if expert_idx is not None and isinstance(expert_idx, int) and 0 <= expert_idx < self.n_expert:
                 cache_key = (target_layer_idx, expert_idx)
 
