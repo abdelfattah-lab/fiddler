@@ -139,6 +139,19 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         self.prefetch_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         self.expert_ready_events = {}  # Track when each expert is ready: (layer, expert) -> event
 
+        # Keep first 2 MoE layers (0-1) permanently on GPU
+        # Since we predict layer+2, layers 0-1 are never prefetched
+        self.gpu_resident_layers = set()
+        if len(self.moe_layers) >= 2:
+            # Move experts from first 2 MoE layers to GPU
+            for i in range(2):
+                layer_idx = self.moe_layers[i]
+                self.gpu_resident_layers.add(layer_idx)
+                moe_layer = self.model.model.layers[layer_idx].mlp
+                for expert_idx, expert in enumerate(moe_layer.experts):
+                    expert.to(self.device, dtype=self.dtype)
+            print(f"🔒 Layers {self.moe_layers[0]}-{self.moe_layers[1]} experts permanently on GPU")
+
         # Initialize dual buffer system
         if len(self.moe_layers) > 0 and not self.collection_mode:
             print(f"🔧 Initializing dual buffer system for {len(self.moe_layers)} MoE layers...")
@@ -238,8 +251,18 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
             # Get routing weights for this expert (same as baseline)
             expert_routing_weights = routing_weights[top_x, idx, None]
 
+            # Check if this is a GPU-resident layer (0-1)
+            if layer_idx in self.gpu_resident_layers:
+                # Use expert directly from GPU (no loading needed)
+                if NVTX_AVAILABLE:
+                    range_id = nvtx.start_range(f"GPU_RESIDENT: Layer{layer_idx}_Expert{expert_idx}")
+                expert_buffer = moe_layer.experts[expert_idx]
+                if NVTX_AVAILABLE:
+                    nvtx.end_range(range_id)
+                self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=True)
+                self.cnt_expert_hit += len(top_x)
             # Check if expert was prefetched, use prefetched version if available
-            if self._is_expert_prefetched(layer_idx, expert_idx):
+            elif self._is_expert_prefetched(layer_idx, expert_idx):
                 # REMOVED: Event wait - this was the PRIMARY CAUSE of no parallelism
                 # Prefetch runs truly async, GPU will naturally wait when accessing tensor if needed
 

@@ -6,15 +6,37 @@ Always update guide.md to prepare it for another agent to look at it and underst
 
 ## Current Status (2025-09-30)
 
-**Implementation**: ✅ Async prefetching fixes applied successfully in `src/fiddler/qwen_with_prefetch.py`
+**Implementation**: ✅ GPU-resident layers 0-1 implemented in `src/fiddler/qwen_with_prefetch.py`
 
-**Problem**: Despite fixing synchronization issues, memory transfers still don't overlap with compute in profiling.
+**Result**: ✅ Hit rate improved from 11.8% → 20.7% by keeping first 2 MoE layers on GPU
 
-## Next Goal
+## Current Goal
 
-**Keep first 2 MoE layers permanently on GPU** - Since these layers are never prefetched (we predict layer+2), keeping layers 0-1 on GPU may improve performance without affecting prefetch logic.
+✅ Created PyTorch version to test if overlap is possible with PyTorch (2025-09-30)
+
+Next: Analyze `pytorch_parallel_overlap.nsys-rep` to verify if PyTorch can achieve compute/memory overlap, or if PyTorch framework inherently prevents it.
 
 ## Recent Work
+
+✅ **PyTorch overlap test** (2025-09-30):
+1. Created `parallel_memory_compute_fixed_torch.py` - pure PyTorch version
+2. Removed all Numba dependencies, uses only PyTorch operations
+3. Uses dual buffers with separate transfer/compute streams
+4. Event-based synchronization between streams (no blocking synchronize)
+5. Profile generated: `pytorch_parallel_overlap.nsys-rep` (~226ms runtime)
+
+**Purpose**: Determine if PyTorch can achieve compute/memory overlap at all, or if the framework adds hidden synchronization that prevents it.
+
+✅ **GPU-resident layers optimization** (2025-09-30):
+1. Keep first 2 MoE layers (0-1) permanently on GPU (line 142-153)
+2. Direct GPU access for layers 0-1 bypassing prefetch logic (line 254-263)
+3. Reasoning: Layer N predicts N+2, so layers 0-1 never get prefetched
+
+**Results**:
+- ✅ Correct output: "The capital of France is ______.\nParis"
+- ✅ Hit rate improved: 11.8% → 20.7%
+- ✅ GPU memory: ~8 experts × 2 layers = 16 experts on GPU (vs 4 in buffers)
+- ⏱️ Speedup: 0.87x (still slower than baseline, needs profiling)
 
 ✅ **Fixed async prefetching implementation** (2025-09-30):
 1. Removed forced event wait blocking parallelism (line 251-252)
@@ -22,10 +44,9 @@ Always update guide.md to prepare it for another agent to look at it and underst
 3. Moved prefetch trigger after expert processing (line 290-298)
 4. Removed hardcoded layer restrictions (line 340)
 
-**Results**:
-- ✅ Correct output: "The capital of France is ______.\nParis"
-- ✅ Hit rate: 11.8% (pattern learning phase)
-- ✅ Profile: `qwen_prefetch_profile_20250930_133058/`
+**Previous results**:
+- Hit rate: 11.8% (before GPU-resident optimization)
+- Profile: `qwen_prefetch_profile_20250930_133058/`
 - ❌ Still no compute/memory overlap observed in Nsight
 
 ## Key Files
@@ -38,7 +59,8 @@ Always update guide.md to prepare it for another agent to look at it and underst
 
 **Qwen Model Setup**:
 - Base model + non-expert layers: GPU
-- All experts (60 experts × 24 MoE layers): CPU
+- MoE layers 0-1 experts: GPU (permanently resident, ~16 experts)
+- MoE layers 2-23 experts: CPU (60 experts × 22 layers)
 - Expert buffers: GPU (dual buffer A/B for alternating layers)
 - Prefetch strategy: Layer N predicts experts for Layer N+2
 
