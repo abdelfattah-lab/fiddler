@@ -59,6 +59,8 @@ class FiddlerQwen:
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        # Set padding side to left for decoder-only models
+        self.tokenizer.padding_side = 'left'
 
         # Load model entirely on CPU to preserve integrated structure
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -115,6 +117,20 @@ class FiddlerQwen:
         """Set up expert management system with GPU buffer."""
         print("🔧 Setting up expert management...")
 
+        # Keep first 2 MoE layers (0-1) permanently on GPU
+        # Since layer N predicts layer N+2 in prefetch, layers 0-1 are never prefetched
+        # So it makes sense to keep them on GPU for faster access
+        self.gpu_resident_layers = set()
+        if len(self.moe_layers) >= 2:
+            # Move experts from first 2 MoE layers to GPU
+            for i in range(2):
+                layer_idx = self.moe_layers[i]
+                self.gpu_resident_layers.add(layer_idx)
+                moe_layer = self.model.model.layers[layer_idx].mlp
+                for expert_idx, expert in enumerate(moe_layer.experts):
+                    expert.to(self.device, dtype=self.dtype)
+            print(f"🔒 Layers {self.moe_layers[0]}-{self.moe_layers[1]} experts permanently on GPU")
+
         if len(self.moe_layers) > 0:
             # Create GPU buffer for single expert
             # Get a sample expert (now on CPU) to create the buffer template
@@ -145,6 +161,10 @@ class FiddlerQwen:
         pinned_count = 0
 
         for layer_idx in self.moe_layers:
+            # Skip GPU-resident layers (0-1)
+            if layer_idx in self.gpu_resident_layers:
+                continue
+
             layer = self.model.model.layers[layer_idx]
             for expert_idx, expert in enumerate(layer.mlp.experts):
                 for param in expert.parameters():
@@ -156,7 +176,7 @@ class FiddlerQwen:
                         param.data = pinned_param
                         pinned_count += 1
 
-        print(f"✅ Pinned {pinned_count} expert parameters")
+        print(f"✅ Pinned {pinned_count} expert pa rameters")
 
     def _hook_moe_layers(self):
         """Hook into MoE layers to add expert management."""
@@ -233,8 +253,20 @@ class FiddlerQwen:
             # Get routing weights for this expert
             expert_routing_weights = routing_weights[top_x, idx, None]
 
-            # Load expert to GPU buffer and execute
-            expert_buffer = self._get_expert_for_execution(layer_idx, expert_idx)
+            # Check if this is a GPU-resident layer (0-1)
+            if layer_idx in self.gpu_resident_layers:
+                # Use expert directly from GPU (no loading needed)
+                expert_buffer = moe_layer.experts[expert_idx]
+                # GPU-resident layers are always "hits" (no loading needed)
+                self.cnt_expert_hit += len(top_x)
+                self.cnt_expert_all += len(top_x)
+            else:
+                # Load expert to GPU buffer and execute
+                expert_buffer = self._get_expert_for_execution(layer_idx, expert_idx)
+                # Update statistics for buffer-loaded experts
+                self.cnt_expert_all += len(top_x)
+                if self.current_expert == (layer_idx, expert_idx):
+                    self.cnt_expert_hit += len(top_x)
 
             # Execute expert computation on GPU
             if current_state.device != expert_buffer.gate_proj.weight.device:
@@ -253,11 +285,6 @@ class FiddlerQwen:
             current_hidden_states = current_hidden_states.to(final_hidden_states.dtype)
 
             final_hidden_states.index_add_(0, top_x, current_hidden_states)
-
-            # Update statistics
-            self.cnt_expert_all += len(top_x)
-            if self.current_expert == (layer_idx, expert_idx):
-                self.cnt_expert_hit += len(top_x)
 
         # Add shared expert (shared expert stays on CPU since model is on CPU)
         shared_expert_output = moe_layer.shared_expert(hidden_states_flat)
@@ -323,9 +350,15 @@ class FiddlerQwen:
             # Get routing weights for this expert
             expert_routing_weights = routing_weights[top_x, idx, None]
 
-            # Execute expert on CPU directly
-            cpu_expert = self.model.model.layers[layer_idx].mlp.experts[expert_idx]
-            expert_output = cpu_expert(current_state)
+            # Check if this layer's experts are on GPU (GPU-resident layers)
+            expert = self.model.model.layers[layer_idx].mlp.experts[expert_idx]
+            if layer_idx in self.gpu_resident_layers:
+                # Expert is on GPU, need to move data to GPU and back to CPU
+                current_state_gpu = current_state.to(self.device)
+                expert_output = expert(current_state_gpu).cpu()
+            else:
+                # Execute expert on CPU directly
+                expert_output = expert(current_state)
 
             # Apply routing weights and accumulate
             current_hidden_states = expert_output * expert_routing_weights
@@ -395,7 +428,8 @@ class FiddlerQwen:
         if text is None:
             text = "The capital of France is"
 
-        inputs = self.tokenizer(text, return_tensors="pt")
+        # Handle batched inputs with padding
+        inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
         input_ids = inputs.input_ids.to(self.device)  # Move to GPU since model is now on GPU
         attention_mask = inputs.attention_mask.to(self.device) if inputs.attention_mask is not None else None
 

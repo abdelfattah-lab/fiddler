@@ -237,6 +237,11 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
 
         # Get dimensions
         batch_size, sequence_length, hidden_dim = hidden_states.shape
+
+        # Fiddler mode: execute on CPU for small batches (inherited from base class)
+        if self.use_fiddler_mode and batch_size < self.fiddler_batch_threshold:
+            return self._moe_forward_cpu(hidden_states, layer_idx, moe_layer, batch_size, sequence_length, hidden_dim)
+
         hidden_states_flat = hidden_states.view(-1, hidden_dim)
 
         # Router computation (same as baseline)
@@ -540,7 +545,8 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         if text is None:
             text = "The capital of France is"
 
-        inputs = self.tokenizer(text, return_tensors="pt")
+        # Handle batched inputs with padding
+        inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
         input_ids = inputs.input_ids.to(self.model.device)
         attention_mask = inputs.attention_mask.to(self.model.device) if inputs.attention_mask is not None else None
 
