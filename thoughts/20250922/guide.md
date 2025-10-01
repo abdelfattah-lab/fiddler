@@ -19,6 +19,10 @@ Always update guide.md to prepare it for another agent to look at it and underst
 
 ## Current Goal
 
+
+It seems like baseline FiddlerQwen is performing worse than Prefetching 0 experts. That does not make sense. It should perform either better or at least the same. Please debug this and fix it.
+
+
 **Objective**: ✅ **COMPLETED** - Evaluated prefetch system vs Fiddler CPU fallback across different batch sizes
 
 **Key Findings**:
