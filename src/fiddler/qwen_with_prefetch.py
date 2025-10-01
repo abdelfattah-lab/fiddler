@@ -113,11 +113,14 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
     """Qwen implementation with prefetch capabilities."""
 
     def __init__(self, args, num_experts_to_prefetch=1):
-        # Initialize base class
+        # Initialize base class (includes Fiddler mode support)
         super().__init__(args)
 
         # Configure number of experts to prefetch per layer (0-16)
         self.num_experts_to_prefetch = max(0, min(16, num_experts_to_prefetch))
+
+        # Fiddler mode is inherited from base class
+        # self.use_fiddler_mode and self.fiddler_batch_threshold are already set
 
         # Initialize prefetch components
         self.profiler = ExpertUsageProfiler(len(self.moe_layers), self.n_expert)

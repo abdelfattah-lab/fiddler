@@ -28,6 +28,10 @@ class FiddlerQwen:
         if hasattr(args, 'max_experts_gpu'):
             self.max_experts_gpu = args.max_experts_gpu
 
+        # Fiddler mode: execute experts on CPU for small batches
+        self.use_fiddler_mode = getattr(args, 'use_fiddler_mode', False)
+        self.fiddler_batch_threshold = getattr(args, 'fiddler_batch_threshold', 8)  # Default: use CPU for batch < 8
+
         print(f"🚀 Loading {self.model_name} with Fiddler expert management")
 
         # Load model with correct device placement
@@ -180,6 +184,11 @@ class FiddlerQwen:
 
         # Get dimensions
         batch_size, sequence_length, hidden_dim = hidden_states.shape
+
+        # Fiddler mode: execute on CPU for small batches
+        if self.use_fiddler_mode and batch_size < self.fiddler_batch_threshold:
+            return self._moe_forward_cpu(hidden_states, layer_idx, moe_layer, batch_size, sequence_length, hidden_dim)
+
         hidden_states_flat = hidden_states.view(-1, hidden_dim)
 
         # Router computation (this stays on CPU since gate is on CPU)
@@ -262,6 +271,86 @@ class FiddlerQwen:
 
         # Return in the same format as original forward (output, router_logits)
         router_logits = router_logits.view(batch_size, sequence_length, -1)
+        return final_hidden_states, router_logits
+
+    def _moe_forward_cpu(self, hidden_states, layer_idx, moe_layer, batch_size, sequence_length, hidden_dim):
+        """Execute MoE forward entirely on CPU for small batches (Fiddler mode)."""
+        # Save original device
+        original_device = hidden_states.device
+
+        # Move hidden states to CPU if needed
+        hidden_states_cpu = hidden_states.cpu() if hidden_states.device != torch.device('cpu') else hidden_states
+        hidden_states_flat = hidden_states_cpu.view(-1, hidden_dim)
+
+        # Router computation on CPU (gate is on GPU, so move input temporarily)
+        router_logits = moe_layer.gate(hidden_states_flat.to(moe_layer.gate.weight.device)).cpu()
+
+        # Routing weights computation
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, moe_layer.top_k, dim=-1)
+
+        if moe_layer.norm_topk_prob:
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+
+        routing_weights = routing_weights.to(hidden_states_cpu.dtype)
+
+        # Initialize output tensor on CPU
+        final_hidden_states = torch.zeros(
+            (batch_size * sequence_length, hidden_dim),
+            dtype=hidden_states_cpu.dtype,
+            device='cpu'
+        )
+
+        # One-hot encode selected experts
+        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=moe_layer.num_experts).permute(2, 1, 0)
+
+        # Find active experts
+        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        # Process each active expert on CPU
+        for i, expert_idx_tensor in enumerate(expert_hit):
+            expert_idx = expert_idx_tensor.item()
+
+            # Find tokens assigned to this expert
+            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
+
+            if len(top_x) == 0:
+                continue
+
+            # Get input for this expert
+            current_state = hidden_states_flat[None, top_x].reshape(-1, hidden_dim)
+
+            # Get routing weights for this expert
+            expert_routing_weights = routing_weights[top_x, idx, None]
+
+            # Execute expert on CPU directly
+            cpu_expert = self.model.model.layers[layer_idx].mlp.experts[expert_idx]
+            expert_output = cpu_expert(current_state)
+
+            # Apply routing weights and accumulate
+            current_hidden_states = expert_output * expert_routing_weights
+            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(final_hidden_states.dtype))
+
+        # Add shared expert (shared expert is on GPU, so need to move data temporarily)
+        hidden_states_for_shared = hidden_states_flat.to(moe_layer.shared_expert.gate_proj.weight.device)
+        shared_expert_output = moe_layer.shared_expert(hidden_states_for_shared)
+        shared_expert_gate = F.sigmoid(moe_layer.shared_expert_gate(hidden_states_for_shared))
+        shared_expert_output = (shared_expert_gate * shared_expert_output).cpu()
+
+        final_hidden_states = final_hidden_states + shared_expert_output
+
+        # Reshape back to original dimensions
+        final_hidden_states = final_hidden_states.view(batch_size, sequence_length, hidden_dim)
+
+        # Move result back to original device
+        if original_device != torch.device('cpu'):
+            final_hidden_states = final_hidden_states.to(original_device)
+
+        router_logits = router_logits.view(batch_size, sequence_length, -1)
+        # Move router_logits back to original device too
+        if original_device != torch.device('cpu'):
+            router_logits = router_logits.to(original_device)
+
         return final_hidden_states, router_logits
 
     def _get_expert_for_execution(self, layer_idx, expert_idx):
