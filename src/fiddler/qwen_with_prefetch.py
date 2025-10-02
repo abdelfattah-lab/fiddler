@@ -112,15 +112,37 @@ class PrefetchMetrics:
 class FiddlerQwenWithPrefetch(FiddlerQwen):
     """Qwen implementation with prefetch capabilities."""
 
-    def __init__(self, args, num_experts_to_prefetch=1):
+    def __init__(self, args, num_experts_to_prefetch=1, all_gpu_mode=False):
         # Initialize base class (includes Fiddler mode support)
         super().__init__(args)
 
+        # All-GPU mode: load all experts on GPU (no prefetch/on-demand)
+        self.all_gpu_mode = all_gpu_mode
+
         # Configure number of experts to prefetch per layer (0-16)
+        # Ignored if all_gpu_mode is True
         self.num_experts_to_prefetch = max(0, min(16, num_experts_to_prefetch))
 
         # Fiddler mode is inherited from base class
         # self.use_fiddler_mode and self.fiddler_batch_threshold are already set
+
+        # All-GPU mode: load all experts on GPU
+        if self.all_gpu_mode:
+            print("🚀 All-GPU mode enabled: loading all experts on GPU...")
+            self._load_all_experts_on_gpu()
+            print(f"✅ All {len(self.moe_layers)} MoE layers with {self.n_expert} experts each loaded on GPU")
+            # Skip prefetch setup in all-GPU mode
+            self.profiler = None
+            self.metrics = None
+            self.collection_mode = False
+            self.prefetch_cache_A = {}
+            self.prefetch_cache_B = {}
+            self.prefetch_buffer_A = {}
+            self.prefetch_buffer_B = {}
+            self.prefetch_stream = None
+            self.expert_ready_events = {}
+            self.gpu_resident_layers = set(self.moe_layers)  # All layers are GPU-resident
+            return
 
         # Initialize prefetch components
         self.profiler = ExpertUsageProfiler(len(self.moe_layers), self.n_expert)
@@ -187,6 +209,16 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         print(f"🔮 Prefetch mode: {'Collection' if self.collection_mode else 'Prediction'}")
         if not self.collection_mode:
             print(f"🎯 Prefetching {self.num_experts_to_prefetch} expert(s) per layer")
+
+    def _load_all_experts_on_gpu(self):
+        """Load all experts from all MoE layers onto GPU."""
+        if not torch.cuda.is_available():
+            return
+
+        for layer_idx in self.moe_layers:
+            moe_layer = self.model.model.layers[layer_idx].mlp
+            for expert_idx, expert in enumerate(moe_layer.experts):
+                expert.to(self.device, dtype=self.dtype)
 
     def _pin_expert_memory(self):
         """Pin CPU memory for all MoE experts to enable async transfers without blocking."""
@@ -258,7 +290,7 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         routing_weights = routing_weights.to(hidden_states.dtype)
 
         # Record expert usage patterns for future prefetching
-        if self.collection_mode:
+        if self.collection_mode and self.profiler is not None:
             self.profiler.record_layer_experts(layer_idx, selected_experts)
 
 
@@ -299,7 +331,8 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
                 expert_buffer = moe_layer.experts[expert_idx]
                 if NVTX_AVAILABLE:
                     nvtx.end_range(range_id)
-                self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=True)
+                if self.metrics is not None:
+                    self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=True)
                 self.cnt_expert_hit += len(top_x)
             # Check if expert was prefetched, use prefetched version if available
             elif self._is_expert_prefetched(layer_idx, expert_idx):
@@ -312,7 +345,8 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
                 expert_buffer = self._get_expert_for_execution_with_prefetch(layer_idx, expert_idx, was_prefetched=True)
                 if NVTX_AVAILABLE:
                     nvtx.end_range(range_id)
-                self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=True)
+                if self.metrics is not None:
+                    self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=True)
                 self.cnt_expert_hit += len(top_x)
             else:
                 # Load expert on-demand using the base class method
@@ -321,7 +355,8 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
                 expert_buffer = self._get_expert_for_execution(layer_idx, expert_idx)
                 if NVTX_AVAILABLE:
                     nvtx.end_range(range_id)
-                self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=False)
+                if self.metrics is not None:
+                    self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=False)
 
             self.cnt_expert_all += len(top_x)
 
@@ -353,7 +388,7 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         # TRIGGER PREFETCH AFTER finishing with current layer's experts
         # Now that we're done with layer N, start prefetching for layer N+2
         # This gives maximum time for async transfer to complete
-        if not self.collection_mode and layer_idx + 2 in self.moe_layers:
+        if not self.collection_mode and self.profiler is not None and layer_idx + 2 in self.moe_layers:
             if NVTX_AVAILABLE:
                 range_id = nvtx.start_range(f"PREFETCH_TRIGGER_AFTER_LAYER: Layer{layer_idx+2}")
             self._trigger_prefetch_for_layer(layer_idx + 2, self.profiler.current_token_pos)
@@ -361,7 +396,7 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
                 nvtx.end_range(range_id)
 
         # Advance token position after the last MoE layer
-        if layer_idx == self.moe_layers[-1]:
+        if self.profiler is not None and layer_idx == self.moe_layers[-1]:
             self.profiler.advance_token_position()
 
         # Return in the same format as original forward (output, router_logits)
@@ -564,10 +599,11 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         self.current_expert = None
 
         # Reset prefetch metrics
-        self.metrics = PrefetchMetrics()
+        if not self.all_gpu_mode:
+            self.metrics = PrefetchMetrics()
 
         # Reset profiler token position for new generation
-        if not self.collection_mode:
+        if not self.collection_mode and self.profiler is not None:
             self.profiler.current_token_pos = 0
 
         start_time = time.time()
@@ -596,13 +632,13 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
 
         # Calculate hit rates
         baseline_hit_rate = self.cnt_expert_hit / self.cnt_expert_all if self.cnt_expert_all > 0 else 0.0
-        prefetch_hit_rate = self.metrics.get_hit_rate()
+        prefetch_hit_rate = self.metrics.get_hit_rate() if self.metrics is not None else 1.0  # All-GPU mode has 100% hit rate
 
         # Store for comparison
         self.last_generated_text = generated_text
 
         # Save patterns if in collection mode
-        if self.collection_mode:
+        if self.collection_mode and self.profiler is not None:
             self.save_expert_patterns()
 
         # For now, approximate prefill vs decode timing
@@ -610,7 +646,10 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         decode_time = total_time * 0.7
 
         print(f"Generated: {generated_text}")
-        print(f"🎯 Prefetch hit rate: {prefetch_hit_rate:.1%}")
+        if self.all_gpu_mode:
+            print(f"🎯 All-GPU mode: All experts on GPU (100% hit rate)")
+        else:
+            print(f"🎯 Prefetch hit rate: {prefetch_hit_rate:.1%}")
 
         # Return prefetch hit rate instead of baseline hit rate
         return (prefill_time, decode_time, prefetch_hit_rate)

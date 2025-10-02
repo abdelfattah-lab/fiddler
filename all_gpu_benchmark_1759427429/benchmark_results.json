@@ -1,0 +1,54 @@
+{
+  "timestamp": 1759427429,
+  "datetime": "2025-10-02T13:50:29.072552",
+  "results": [
+    {
+      "name": "Baseline (on-demand)",
+      "avg_time": 1.612,
+      "std_time": 0.002,
+      "min_time": 1.61,
+      "max_time": 1.614,
+      "speedup_vs_baseline": 1.0
+    },
+    {
+      "name": "All-GPU mode",
+      "avg_time": 0.431,
+      "std_time": 0.001,
+      "min_time": 0.43,
+      "max_time": 0.433,
+      "speedup_vs_baseline": 3.74
+    },
+    {
+      "name": "Prefetch (0 experts)",
+      "avg_time": 1.626,
+      "std_time": 0.001,
+      "min_time": 1.625,
+      "max_time": 1.629,
+      "speedup_vs_baseline": 0.99
+    },
+    {
+      "name": "Prefetch (4 experts)",
+      "avg_time": 0.85,
+      "std_time": 0.423,
+      "min_time": 0.636,
+      "max_time": 1.696,
+      "speedup_vs_baseline": 1.9
+    },
+    {
+      "name": "Prefetch (7 experts)",
+      "avg_time": 0.951,
+      "std_time": 0.419,
+      "min_time": 0.632,
+      "max_time": 1.682,
+      "speedup_vs_baseline": 1.7
+    },
+    {
+      "name": "Prefetch (16 experts)",
+      "avg_time": 0.654,
+      "std_time": 0.001,
+      "min_time": 0.653,
+      "max_time": 0.655,
+      "speedup_vs_baseline": 2.47
+    }
+  ]
+}
