@@ -19,6 +19,41 @@ Always update guide.md to prepare it for another agent to look at it and underst
 
 ## Current Goal
 
+✅ **COMPLETED** (2025-10-02) - Made repo easy to run on another machine
+
+**Objective**: Extract dependencies and create comprehensive setup guide for reproducing results.
+
+**Completed Tasks**:
+1. ✅ Extracted all dependencies from current working environment
+2. ✅ Created `requirements.txt` with pinned versions from `pip freeze`
+3. ✅ Created comprehensive `getting_started.md` with:
+   - System requirements (hardware/software)
+   - Installation steps (conda/venv)
+   - Quick start guide
+   - Benchmarking instructions
+   - Profiling with Nsight Systems
+   - Architecture overview
+   - Usage examples
+   - Troubleshooting tips
+   - Expected performance metrics
+
+**Files Created**:
+- `requirements.txt` - Complete dependency list with versions from working environment
+- `getting_started.md` - Comprehensive setup and usage guide
+
+**Key Dependencies** (from working environment):
+- Python 3.10.18
+- torch==2.8.0
+- transformers==4.56.2
+- accelerate==1.10.1
+- nvtx==0.2.13 (for profiling)
+- matplotlib==3.10.6 (for plotting)
+- numpy==1.23.5
+
+**Next Goal**: TBD - Repository is now ready for deployment on another machine
+
+## Previous Work
+
 ✅ **COMPLETED** (2025-10-01) - Benchmarked prefetch configurations with Fiddler mode enabled
 
 **Objective**: Compare prefetch configurations (0-16 experts) vs baseline across different batch sizes with `use_fiddler_mode=True` enabled, which automatically uses CPU execution for batch<8 and GPU execution for batch>=8.
@@ -425,7 +460,23 @@ Despite async implementation with separate CUDA stream:
 
 ## Files Changed
 
-### Modified (Current Session - Baseline Performance Fix):
+### Created (Current Session - Getting Started Guide):
+1. **getting_started.md**:
+   - Comprehensive setup guide for new machines
+   - Installation instructions (conda/venv)
+   - Quick start examples
+   - Benchmarking and profiling guides
+   - Architecture overview and usage examples
+   - Troubleshooting section
+   - Expected performance metrics table
+
+2. **requirements.txt** (updated):
+   - Extracted from working environment via `pip freeze`
+   - Pinned versions for reproducibility
+   - Organized by category (core, data, visualization, profiling, etc.)
+   - Includes all dependencies: torch==2.8.0, transformers==4.56.2, accelerate==1.10.1, etc.
+
+### Modified (Previous Session - Baseline Performance Fix):
 1. **src/fiddler/qwen.py**:
    - Added GPU-resident layers 0-1 optimization (lines 121-130)
    - Added `gpu_resident_layers` set to track permanently GPU-resident layers
@@ -538,6 +589,47 @@ Despite async implementation with separate CUDA stream:
 - Various `.nsys-rep` profile files
 
 ## Suggested Commit Message
+
+```
+Add getting started guide and dependencies for reproducibility
+
+Created comprehensive setup documentation to make the repository easy to
+deploy on new machines. Extracted all dependencies from working environment
+and documented installation, usage, and benchmarking procedures.
+
+New Files:
+- getting_started.md: Complete setup and usage guide covering:
+  * System requirements (Python 3.10+, CUDA 12.x, 24GB+ GPU)
+  * Installation steps (conda/venv + pip install)
+  * Quick start with test scripts
+  * Benchmarking all prefetch configurations (0-16 experts)
+  * Profiling with Nsight Systems
+  * Architecture overview and implementation details
+  * Usage examples for custom configurations
+  * Troubleshooting common issues
+  * Expected performance metrics (3.21x speedup with 7 experts)
+
+- requirements.txt: Updated with pinned dependencies from working environment
+  * Core: torch==2.8.0, transformers==4.56.2, accelerate==1.10.1
+  * Profiling: nvtx==0.2.13
+  * Visualization: matplotlib==3.10.6
+  * Data: numpy==1.23.5, pandas==2.3.3
+  * All HuggingFace ecosystem packages
+  * CUDA libraries (reference only)
+
+Impact:
+- Enables easy reproduction of 3.21x speedup results on new machines
+- Documents optimal configuration (7 experts, 52.1% hit rate)
+- Provides clear path from installation to benchmarking to profiling
+- Includes troubleshooting for common setup issues
+
+Files changed:
+- getting_started.md (new)
+- requirements.txt (updated)
+- thoughts/20250922/guide.md (updated)
+```
+
+## Alternative Suggested Commit Message (Previous Work)
 
 ```
 Fix baseline performance parity with prefetch(0 experts)

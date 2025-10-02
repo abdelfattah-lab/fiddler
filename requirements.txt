@@ -1,3 +1,45 @@
-accelerate==0.26.1
-torch==2.1.2
-transformers==4.36.2
+# Fiddler MoE Optimization - Dependencies
+# Generated from working environment on 2025-10-02
+
+# Core ML/DL frameworks
+torch==2.8.0
+transformers==4.56.2
+accelerate==1.10.1
+
+# Data processing
+numpy==1.23.5
+pandas==2.3.3
+
+# Visualization (for benchmarking and plotting)
+matplotlib==3.10.6
+
+# Profiling (for NVTX markers in Nsight Systems)
+nvtx==0.2.13
+
+# HuggingFace ecosystem
+huggingface-hub==0.35.0
+tokenizers==0.22.1
+safetensors==0.6.2
+datasets==4.1.1
+
+# Quantization (optional - for bitsandbytes support)
+bitsandbytes==0.47.0
+
+# Utilities
+tqdm==4.67.1
+regex==2025.9.18
+filelock==3.19.1
+fsspec==2025.9.0
+PyYAML==6.0.2
+requests==2.32.5
+
+# Numeric computing
+scipy==1.15.3
+numba==0.62.1
+
+# NVIDIA CUDA libraries (auto-installed with torch but listed for reference)
+nvidia-cuda-runtime-cu12==12.8.90
+nvidia-cudnn-cu12==9.10.2.21
+nvidia-cublas-cu12==12.8.4.1
+nvidia-nvtx-cu12==12.8.90
+triton==3.4.0
