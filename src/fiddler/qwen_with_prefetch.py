@@ -38,9 +38,17 @@ class ExpertUsageProfiler:
         if token_key not in self.expert_patterns:
             self.expert_patterns[token_key] = {}
 
-        # Take top-k experts (Qwen uses top_k=4)
+        # Take top-k experts (Qwen uses top_k=4) and get unique values
+        # This ensures we prefetch all necessary experts without duplicates
+        # IMPORTANT: Preserve order of first occurrence, don't sort!
         top_k_experts = selected_experts.flatten().tolist()
-        self.expert_patterns[token_key][layer_key] = top_k_experts
+        seen = set()
+        unique_experts = []
+        for expert in top_k_experts:
+            if expert not in seen:
+                seen.add(expert)
+                unique_experts.append(expert)
+        self.expert_patterns[token_key][layer_key] = unique_experts
 
     def advance_token_position(self):
         """Move to next token position (called after each complete forward pass)."""
@@ -112,16 +120,16 @@ class PrefetchMetrics:
 class FiddlerQwenWithPrefetch(FiddlerQwen):
     """Qwen implementation with prefetch capabilities."""
 
-    def __init__(self, args, num_experts_to_prefetch=1, all_gpu_mode=False):
+    def __init__(self, args, num_experts_to_prefetch=20, all_gpu_mode=False):
         # Initialize base class (includes Fiddler mode support)
         super().__init__(args)
 
         # All-GPU mode: load all experts on GPU (no prefetch/on-demand)
         self.all_gpu_mode = all_gpu_mode
 
-        # Configure number of experts to prefetch per layer (0-16)
+        # Configure number of experts to prefetch per layer (0-30)
         # Ignored if all_gpu_mode is True
-        self.num_experts_to_prefetch = max(0, min(16, num_experts_to_prefetch))
+        self.num_experts_to_prefetch = max(0, min(30, num_experts_to_prefetch))
 
         # Fiddler mode is inherited from base class
         # self.use_fiddler_mode and self.fiddler_batch_threshold are already set
@@ -336,8 +344,10 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
                 self.cnt_expert_hit += len(top_x)
             # Check if expert was prefetched, use prefetched version if available
             elif self._is_expert_prefetched(layer_idx, expert_idx):
-                # REMOVED: Event wait - this was the PRIMARY CAUSE of no parallelism
-                # Prefetch runs truly async, GPU will naturally wait when accessing tensor if needed
+                # Wait for prefetch to complete to ensure data integrity
+                # The async copy must finish before we use the expert
+                if self.prefetch_stream is not None:
+                    self.prefetch_stream.synchronize()
 
                 # Use prefetched expert
                 if NVTX_AVAILABLE:

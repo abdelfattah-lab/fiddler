@@ -38,6 +38,45 @@ nsys profile --trace=cuda,nvtx,osrt --cuda-memory-usage=true python <script.py>
 
 ## Current Goal
 
+✅ **COMPLETED** (2025-10-02) - Achieved 100% prefetch hit ratio with deterministic generation
+
+**Objective**: Modify temperature to 0 for deterministic generation, remove saved patterns, and achieve 100% hit ratio with correct output.
+
+**Completed Tasks**:
+1. ✅ Verified temperature already set to 0 (do_sample=False in generate())
+2. ✅ Removed old expert usage pattern files
+3. ✅ Modified pattern collection to store unique experts only (removed duplicates while preserving order)
+4. ✅ Increased num_experts_to_prefetch default from 1 to 20
+5. ✅ Increased buffer size cap from 16 to 30 experts per layer
+6. ✅ **CRITICAL FIX**: Added stream synchronization before using prefetched experts to prevent data race
+
+**Root Cause**: Async prefetch stream was not synchronized before accessing prefetched experts, causing the compute stream to use partially-copied or stale data, leading to incorrect outputs (e.g., "Paris. A" instead of "______.\nParis").
+
+**Solution**: Added `self.prefetch_stream.synchronize()` before accessing prefetched experts (line 350) to ensure async H2D copy completes before use.
+
+**Test Results** (Qwen/Qwen1.5-MoE-A2.7B, "The capital of France is", 3 output tokens):
+- **Collection Mode**: "______.\nParis" ✅ (8.9% hit rate - expected, no prefetch)
+- **Prediction Mode**: "______.\nParis" ✅ (100.0% hit rate!)
+- **Output Correctness**: Perfect match with baseline ✅
+
+**Key Findings**:
+1. Deterministic generation (do_sample=False) was already enabled
+2. With 5-token input and top_k=4, we get 13-18 unique experts per layer (from batch×seq flattening)
+3. Decode tokens (1 token each) need exactly 4 experts per layer
+4. Stream synchronization is CRITICAL for correctness - without it, hit rate was 80% and output was corrupted
+5. Synchronization does add overhead but ensures data integrity
+
+**Files Modified**:
+- `src/fiddler/qwen_with_prefetch.py`:
+  * Changed default num_experts_to_prefetch from 1 to 20 (line 117)
+  * Increased buffer size cap from 16 to 30 (line 126)
+  * Modified pattern collection to preserve order of unique experts (lines 41-51)
+  * **Added stream synchronization before using prefetched experts (lines 347-350)**
+
+**Next Goal**: Performance benchmark with 100% hit ratio to measure actual speedup vs baseline.
+
+Previous Steps:
+
 ✅ **COMPLETED** (2025-10-02) - Added all-GPU mode and benchmarked vs prefetch modes
 
 **Objective**: Add all-GPU mode to load all experts on GPU, then compare performance against prefetch modes.
