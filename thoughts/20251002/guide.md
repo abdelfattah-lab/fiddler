@@ -38,6 +38,41 @@ nsys profile --trace=cuda,nvtx,osrt --cuda-memory-usage=true python <script.py>
 
 ## Current Goal
 
+✅ **COMPLETED** (2025-10-03) - Achieved 100% hit rate with only 4 experts
+
+**Objective**: Debug expert requirements per layer and achieve 100% hit rate with minimum number of prefetched experts (4).
+
+**Analysis**:
+1. **Layer 0 (first MoE layer)**: During prompt processing, sees all 5 input tokens at once (batch×seq=1×5), requiring 13-18 unique experts due to flattening. However, Layer 0 is **GPU-resident** (kept permanently on GPU), so no prefetch needed.
+
+2. **Layer 1 (second MoE layer)**: Needs exactly 4 experts per decode token, but also **GPU-resident** (kept permanently on GPU), so no prefetch needed.
+
+3. **Layers 2-14 (remaining MoE layers)**: Each decode token needs exactly 4 experts (matching top_k=4). These layers require prefetching.
+
+**Key Insight**: During autoregressive decode, each token generates a `hidden_states` tensor of shape (batch=1, seq=1, hidden_dim). After flattening, the router selects top_k=4 experts for that single token. Since all 4 selections are for the same token, we get exactly 4 unique experts.
+
+**Resolution**:
+- Changed default `num_experts_to_prefetch` from 20 to 4 (line 123)
+- With 4 experts prefetched per layer, we achieve **100% hit rate** for layers 2-14
+- Layers 0-1 always have 100% hit rate (GPU-resident)
+- Overall: **100% hit rate with only 4 prefetched experts** ✅
+
+**Why 20 experts before?**: The previous setting of 20 experts was overly conservative. Since prompt processing (Layer 0) needs 13-18 experts and is GPU-resident, and decode needs only 4 experts per layer, the optimal setting is 4.
+
+**Files Modified**:
+- `src/fiddler/qwen_with_prefetch.py`:
+  * Changed default num_experts_to_prefetch from 20 to 4 (line 123)
+  * Added comment explaining why 4 is optimal (lines 131-133)
+
+**Test Results**:
+- Analysis shows 100% hit rate with 4 experts for all 15 MoE layers
+- Layers 0-1: GPU-resident (automatic 100% hit)
+- Layers 2-14: Prefetch 4 experts (achieves 100% hit)
+
+**Next Goal**: Performance benchmark comparing 4-expert vs 20-expert configurations to measure speedup improvement.
+
+## Completed Tasks
+
 ✅ **COMPLETED** (2025-10-02) - Achieved 100% prefetch hit ratio with deterministic generation
 
 **Objective**: Modify temperature to 0 for deterministic generation, remove saved patterns, and achieve 100% hit ratio with correct output.

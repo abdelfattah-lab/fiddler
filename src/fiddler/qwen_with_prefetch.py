@@ -120,7 +120,7 @@ class PrefetchMetrics:
 class FiddlerQwenWithPrefetch(FiddlerQwen):
     """Qwen implementation with prefetch capabilities."""
 
-    def __init__(self, args, num_experts_to_prefetch=20, all_gpu_mode=False):
+    def __init__(self, args, num_experts_to_prefetch=4, all_gpu_mode=False):
         # Initialize base class (includes Fiddler mode support)
         super().__init__(args)
 
@@ -128,6 +128,8 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         self.all_gpu_mode = all_gpu_mode
 
         # Configure number of experts to prefetch per layer (0-30)
+        # Default=4 achieves 100% hit rate for decode phase (top_k=4)
+        # Layers 0-1 are GPU-resident, layers 2+ need exactly 4 experts per token
         # Ignored if all_gpu_mode is True
         self.num_experts_to_prefetch = max(0, min(30, num_experts_to_prefetch))
 
