@@ -45,7 +45,7 @@ def run_baseline():
     # Actual benchmark run
     print("\nBenchmark run...")
     start_time = time.time()
-    prefill_time, decode_time, hit_rate = model.generate(
+    prefill_time, decode_time, prefill_hit_rate, decode_hit_rate = model.generate(
         "The capital of France is",
         output_token=20
     )
@@ -57,7 +57,7 @@ def run_baseline():
     del model
     torch.cuda.empty_cache()
 
-    return prefill_time, decode_time, total_time, hit_rate
+    return prefill_time, decode_time, total_time, prefill_hit_rate, decode_hit_rate
 
 
 def run_prefetch_config(num_experts, pattern_file_exists):
@@ -96,19 +96,20 @@ def run_prefetch_config(num_experts, pattern_file_exists):
     # Actual benchmark run
     print("\nBenchmark run...")
     start_time = time.time()
-    prefill_time, decode_time, hit_rate = model.generate(
+    prefill_time, decode_time, prefill_hit_rate, decode_hit_rate = model.generate(
         "The capital of France is",
         output_token=20
     )
     total_time = time.time() - start_time
 
-    print(f"✅ Config completed: {total_time:.3f}s (Prefill: {prefill_time:.3f}s, Decode: {decode_time:.3f}s), Hit rate: {hit_rate:.1%}")
+    print(f"✅ Config completed: {total_time:.3f}s (Prefill: {prefill_time:.3f}s, Decode: {decode_time:.3f}s)")
+    print(f"   Hit rates - Prefill: {prefill_hit_rate:.1%}, Decode: {decode_hit_rate:.1%}")
 
     # Cleanup
     del model
     torch.cuda.empty_cache()
 
-    return prefill_time, decode_time, total_time, hit_rate
+    return prefill_time, decode_time, total_time, prefill_hit_rate, decode_hit_rate
 
 
 def plot_results(results, output_dir):
@@ -117,7 +118,8 @@ def plot_results(results, output_dir):
     speedups = [r['speedup'] for r in results]
     prefill_speedups = [r['prefill_speedup'] for r in results]
     decode_speedups = [r['decode_speedup'] for r in results]
-    hit_rates = [r['hit_rate'] for r in results]
+    prefill_hit_rates = [r['prefill_hit_rate'] for r in results]
+    decode_hit_rates = [r['decode_hit_rate'] for r in results]
 
     # Create figure with three subplots
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 5))
@@ -156,11 +158,13 @@ def plot_results(results, output_dir):
     ax2.legend()
 
     # Plot 3: Hit Rate vs Config
-    ax3.plot(configs, [hr * 100 for hr in hit_rates], 'mo-', linewidth=2, markersize=8)
+    ax3.plot(configs, [hr * 100 for hr in prefill_hit_rates], 'go-', linewidth=2, markersize=8, label='Prefill')
+    ax3.plot(configs, [hr * 100 for hr in decode_hit_rates], 'ro-', linewidth=2, markersize=8, label='Decode')
     ax3.set_xlabel('Number of Experts Prefetched', fontsize=12)
     ax3.set_ylabel('Prefetch Hit Rate (%)', fontsize=12)
     ax3.set_title('Prefetch Hit Rate vs Configuration', fontsize=14, fontweight='bold')
     ax3.grid(True, alpha=0.3)
+    ax3.legend()
 
     plt.tight_layout()
 
@@ -195,14 +199,14 @@ def main():
     pattern_file_exists = os.path.exists(pattern_file)
 
     # Run baseline
-    baseline_prefill_time, baseline_decode_time, baseline_total_time, baseline_hit_rate = run_baseline()
+    baseline_prefill_time, baseline_decode_time, baseline_total_time, baseline_prefill_hit_rate, baseline_decode_hit_rate = run_baseline()
 
     # Test different configurations
     results = []
     configs_to_test = list(range(0, 17))  # 0 to 16 experts
 
     for num_experts in configs_to_test:
-        prefill_time, decode_time, total_time, hit_rate = run_prefetch_config(num_experts, pattern_file_exists)
+        prefill_time, decode_time, total_time, prefill_hit_rate, decode_hit_rate = run_prefetch_config(num_experts, pattern_file_exists)
 
         # Skip if we couldn't run this config
         if prefill_time is None:
@@ -223,7 +227,8 @@ def main():
             'speedup': total_speedup,
             'prefill_speedup': prefill_speedup,
             'decode_speedup': decode_speedup,
-            'hit_rate': hit_rate
+            'prefill_hit_rate': prefill_hit_rate,
+            'decode_hit_rate': decode_hit_rate
         }
         results.append(result)
 
@@ -236,7 +241,8 @@ def main():
     csv_path = os.path.join(output_dir, 'benchmark_results.csv')
     with open(csv_path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=['num_experts', 'prefill_time', 'decode_time', 'total_time',
-                                                 'prefill_speedup', 'decode_speedup', 'speedup', 'hit_rate'])
+                                                 'prefill_speedup', 'decode_speedup', 'speedup',
+                                                 'prefill_hit_rate', 'decode_hit_rate'])
         writer.writeheader()
         writer.writerows(results)
 
@@ -247,7 +253,8 @@ def main():
         'baseline_prefill_time': baseline_prefill_time,
         'baseline_decode_time': baseline_decode_time,
         'baseline_total_time': baseline_total_time,
-        'baseline_hit_rate': baseline_hit_rate,
+        'baseline_prefill_hit_rate': baseline_prefill_hit_rate,
+        'baseline_decode_hit_rate': baseline_decode_hit_rate,
         'timestamp': timestamp,
         'configs': results
     }
@@ -276,8 +283,8 @@ def main():
     sorted_results = sorted(results, key=lambda x: x['speedup'], reverse=True)
     for i, result in enumerate(sorted_results[:5]):
         print(f"{i+1}. {result['num_experts']} experts: {result['speedup']:.3f}x total speedup "
-              f"(Prefill: {result['prefill_speedup']:.3f}x, Decode: {result['decode_speedup']:.3f}x, "
-              f"Hit rate: {result['hit_rate']:.1%})")
+              f"(Prefill: {result['prefill_speedup']:.3f}x, Decode: {result['decode_speedup']:.3f}x)")
+        print(f"   Hit rates - Prefill: {result['prefill_hit_rate']:.1%}, Decode: {result['decode_hit_rate']:.1%}")
 
     print(f"\nBest configurations by prefill speedup:")
     sorted_by_prefill = sorted(results, key=lambda x: x['prefill_speedup'], reverse=True)

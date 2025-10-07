@@ -6,569 +6,152 @@ Always update guide.md to prepare it for another agent to look at it and underst
 
 ## Current Goal
 
-**STATUS**: ✅ FULLY RESOLVED - Prefetching achieves **2.69x speedup**!
+✅ COMPLETED: Separate prefill and decode hit rate tracking has been implemented. Both `qwen.py` and `qwen_with_prefetch.py` now return separate hit rates for prefill and decode phases.
 
-### 🎯 FINAL CORRECTED ANALYSIS
+## 🎯 Project Status
 
-**Issue Found**: Profiling measured total execution time (10-11s) including initialization, not just inference time (1-2s) like benchmark does.
+**STATUS**: ✅ Qwen MoE prefetching system fully operational with comprehensive performance analysis
 
-**Solution**: Direct timing measurement matching benchmark methodology revealed the TRUE speedup.
-
-### ✅ Confirmed Results
-
-**Direct Inference Timing** (matching benchmark):
-
-| Config | Inference Time | Speedup | Hit Rate | Profile Transfers | Profile Mem Time |
-|--------|---------------|---------|----------|------------------|-----------------|
-| **0 experts** | 1.9138s | 1.0x | 8.5% | 5,447 | 1.93s |
-| **6 experts** | 0.7117s | **2.69x** ✅ | 56.5% | 8,899 (+63%) | 2.99s (+55%) |
-
-**Benchmark Results**: 6 experts = **2.88x speedup** (matches our 2.69x!)
-
-### 🔑 Key Discovery: Why Speedup Despite More Transfers?
-
-**The Paradox**: 6 experts has:
-- 63% MORE total transfers (8,899 vs 5,447)
-- 55% MORE total transfer time (2.99s vs 1.93s)
-- But **2.69x FASTER inference!**
-
-**The Answer**: **Transfer/Compute Overlap**
-
-**0 Experts (Serial - 1.91s)**:
-```
-Compute → WAIT for transfer → Compute → WAIT → Compute
-```
-- Every expert transfer blocks the GPU
-- Critical path = Compute + Transfers (serial)
-
-**6 Experts (Parallel - 0.71s)**:
-```
-Compute Token N  ||  Prefetch for Token N+2
-```
-- Transfers overlap with compute (hidden cost)
-- 56.5% hit rate = most experts already on GPU
-- Critical path ≈ Compute only (transfers hidden)
-
-**Result**: Eliminated ~1.2s of waiting → **2.69x speedup!**
-
-### Why Profiling Was Misleading
-
-**What I measured initially**:
-- Total CUDA API time: 10.75s → 11.15s (3.7% slower)
-- Includes 8-9s initialization overhead
-- Extra init for prefetch buffers masked the speedup
-
-**What benchmark measures**:
-- Pure inference time: 1.91s → 0.71s (2.69x faster)
-- Isolates actual inference performance
-- Shows true speedup from overlap
-
-**Conclusion**:
-- ✅ **Prefetching WORKS** - 2.69x speedup confirmed!
-- ✅ **Overlap is the key** - transfers hidden behind compute
-- ✅ **Hit rate matters** - 56.5% hit rate enables the speedup
-- ✅ **Profiling shows WHERE** (overlap), **benchmark shows HOW MUCH** (2.69x)
-
-**Detailed Analysis**: `speedup_analysis.md`
-
-## Previous steps
-
-## ✅ COMPLETED: Parallel Memory Compute Demonstration
-
-**Status**: ✅ **SUCCESSFULLY COMPLETED** - Fixed and profiled parallel memory compute workload
-
-The parallel compute and host-to-device memory transfer demonstration has been successfully implemented and profiled:
-
-### **🎯 IMPLEMENTATION RESULTS**
-
-**Fixed Implementation**: `parallel_memory_compute_fixed.py`
-- ✅ Fixed original `parallel_memory_compute.py` which had synchronization issues
-- ✅ Implemented proper double-buffered memory transfers with compute overlap
-- ✅ Uses separate CUDA streams for memory transfer and compute operations
-- ✅ Correctness verification: All GPU results match CPU calculations exactly
-
-**Performance Results**:
-- **Total Elements**: 41,943,040 (40M float32 elements, ~160MB)
-- **Chunk Size**: 10,485,760 (10M elements, ~40MB per chunk)
-- **Execution Time**: ~100ms with overlapped memory transfer and compute
-- **Correctness**: ✅ All samples verified (GPU == CPU results, diff < 1e-6)
-
-### **📁 Nsight Systems Profile**
-
-**📊 Report Location**: `parallel_memory_compute_profile.nsys-rep`
-
-**Analysis Commands**:
-```bash
-# GUI analysis (recommended for visual inspection)
-nsight-sys parallel_memory_compute_profile.nsys-rep
-
-# Memory transfer analysis
-nsys stats --report cuda_gpu_mem_time_sum parallel_memory_compute_profile.nsys-rep
-
-# Kernel execution analysis
-nsys stats --report cuda_gpu_kern_sum parallel_memory_compute_profile.nsys-rep
-```
-
-### **🔧 Key Technical Implementation**
-
-**Stream-Based Overlap Architecture**:
-- ✅ `transfer_stream`: Handles asynchronous H2D memory transfers
-- ✅ `compute_stream`: Handles kernel execution and D2H result transfers
-- ✅ **Double Buffering**: Alternates between Buffer A and Buffer B for continuous overlap
-- ✅ **Event Synchronization**: Proper event-based coordination between streams
-
-**Memory Transfer Pattern**:
-- ✅ **Host-to-Device**: Pinned host memory → GPU buffers (async on transfer_stream)
-- ✅ **Compute**: Heavy elementwise kernel with 100 iterations per element (compute_stream)
-- ✅ **Device-to-Host**: GPU results → pinned host memory (async on compute_stream)
-- ✅ **Overlap**: Next chunk transfer runs concurrently with current chunk computation
-
-### **🚀 Profile Demonstrates**
-
-The Nsight Systems profile (`parallel_memory_compute_profile.nsys-rep`) clearly shows:
-1. **Parallel Memory Operations**: H2D transfers running concurrently with kernel execution
-2. **Stream Utilization**: Separate streams enabling true parallelism
-3. **Double Buffer Efficiency**: Ping-pong buffers maximizing GPU utilization
-4. **Memory Bandwidth Utilization**: Sustained memory transfer during compute phases
-
-**Files Created**:
-- ✅ `parallel_memory_compute_fixed.py` - Working implementation with proper overlap
-- ✅ `parallel_memory_compute_profile.nsys-rep` - Nsight Systems profile showing parallel operations
-
-
-### **📁 INVESTIGATION ARTIFACTS**
-
-**Profiling Locations**:
-- `true_parallel_baseline.nsys-rep` - Controlled parallel workload (1.50x speedup)
-- `our_prefetch_implementation.nsys-rep` - Current implementation (0.76x slowdown)
-- `qwen_prefetch_profile_20250927_205136/` - Final debugging profiles
-
-**Test Programs Created**:
-- `test_true_parallelism.py` - Controlled CUDA parallelism test
-- `test_stream_independence.py` - CUDA stream functionality verification
-- `test_parallel_workload.py` - Memory transfer + computation overlap testing
-
-### **💡 KEY INSIGHTS**
-
-**The async prefetching approach has fundamental limitations**:
-1. **Memory bandwidth is the bottleneck** - Multiple expert transfers cannot run in parallel due to PCIe limitations
-2. **Transformers framework adds hidden sync points** - Making true async operation extremely difficult
-3. **The overhead outweighs benefits** - 200x more memory operations negate any parallelism gains
-
-**Files Modified**:
-- ✅ `src/fiddler/qwen_with_prefetch.py` - Multiple async implementations attempted
-- ✅ Investigation shows approach needs fundamental rethinking
-
-### **📋 CONCLUSION**
-
-The investigation conclusively shows that **async prefetching with separate CUDA streams does not achieve parallelism** in this MoE context due to hardware bandwidth limitations and framework synchronization overhead. The approach requires a fundamentally different strategy.
-
-## ✅ COMPLETED: Qwen Prefetch Nsight Profiling
-
-**Status**: ✅ **SUCCESSFULLY COMPLETED** - Generated fresh Nsight profiles for qwen_with_prefetch
-
-**📁 Report Location**: `qwen_prefetch_profile_20250927_165134/`
-
-**✅ Generated Reports**:
-- **Collection Mode**: `qwen_prefetch_profile_20250927_165134/qwen_prefetch_collection.nsys-rep`
-  - Pattern learning phase (0% prefetch hit rate)
-  - Fresh profiling run for baseline comparison
-- **Prediction Mode**: `qwen_prefetch_profile_20250927_165134/qwen_prefetch_prediction.nsys-rep`
-  - Active prefetching phase with learned patterns
-  - Shows prefetch utilization and expert memory transfer patterns
-
-**🔍 GUI Analysis Commands**:
-```bash
-# Collection mode analysis
-nsight-sys qwen_prefetch_profile_20250927_165134/qwen_prefetch_collection.nsys-rep
-
-# Prediction mode analysis
-nsight-sys qwen_prefetch_profile_20250927_165134/qwen_prefetch_prediction.nsys-rep
-```
-
-**📊 Additional Analysis Options**:
-```bash
-# Memory transfer comparison
-nsys stats --report cuda_gpu_mem_time_sum qwen_prefetch_profile_20250927_165134/qwen_prefetch_collection.nsys-rep
-nsys stats --report cuda_gpu_mem_time_sum qwen_prefetch_profile_20250927_165134/qwen_prefetch_prediction.nsys-rep
-
-# NVTX markers (if available in prediction mode)
-nsys stats --report nvtx_sum qwen_prefetch_profile_20250927_165134/qwen_prefetch_prediction.nsys-rep
-```
-
-
-**Status**: ✅ **SUCCESSFULLY IMPLEMENTED** - Dual buffer system with Buffer A/B alternating design
-
-The dual buffer system has been successfully implemented in `qwen_with_prefetch.py` following the specification:
-- **Buffer A**: Handles even layers (0, 2, 4, ...)
-- **Buffer B**: Handles odd layers (1, 3, 5, ...)
-- **Pipeline Design**: When processing layer N, prefetch for layer N+2 is triggered into appropriate buffer
-- **Hit Rate**: Achieving 47.1% prefetch hit rate with correct output generation
-
-### **🎯 TECHNICAL IMPLEMENTATION COMPLETED**
-
-**Buffer Architecture**:
-- ✅ `prefetch_buffer_A`: 4 expert slots for even MoE layers
-- ✅ `prefetch_buffer_B`: 4 expert slots for odd MoE layers
-- ✅ `prefetch_cache_A`: Tracks prefetched experts for even layers
-- ✅ `prefetch_cache_B`: Tracks prefetched experts for odd layers
-
-**Prefetch Logic**:
-- ✅ Layer parity determination via `_get_layer_index_in_moe_list()`
-- ✅ Appropriate buffer selection based on `layer_moe_index % 2`
-- ✅ Expert retrieval from correct buffer during forward pass
-- ✅ Alternating buffer clearing and loading during prefetch triggering
-
-**Performance Results**:
-- ✅ **Correct Output**: "The capital of France is ______.\nParis" (matches baseline)
-- ✅ **Prefetch Hit Rate**: 47.1% (effective pattern utilization)
-- ✅ **System Stability**: No degradation from dual buffer architecture
-
-### **🔧 FILES MODIFIED**
-- ✅ `src/fiddler/qwen_with_prefetch.py` - Complete dual buffer implementation
-
-
-## ✅ Previous GOAL ACHIEVED: Qwen Prefetch Profiling with Expert Activity Highlighting
-
-**Status**: ✅ **SUCCESSFULLY COMPLETED** - qwen_with_prefetch profiling with detailed expert memory transfer patterns
-
-I've successfully profiled qwen_with_prefetch with comprehensive Nsight Systems profiling that clearly shows expert prefetching and expert fetching patterns. The profiles capture both collection mode (pattern learning) and prediction mode (prefetch utilization).
-
-### **🎯 PROFILING RESULTS**
-
-**📁 Report Location**: `qwen_prefetch_profile_20250925_210726/`
-
-**✅ Generated Reports**:
-- **Collection Mode**: `qwen_prefetch_profile_20250925_210726/qwen_prefetch_collection.nsys-rep`
-  - Pattern learning phase (0% prefetch hit rate)
-  - No NVTX markers (collection mode only)
-- **Prediction Mode**: `qwen_prefetch_profile_20250925_210726/qwen_prefetch_prediction.nsys-rep`
-  - Active prefetching phase with **comprehensive NVTX markers**
-  - **EXPERT_PREFETCH_TRIGGER**: 21 instances showing prefetch triggering (7ms avg per trigger)
-  - **EXPERT_LOAD_ON_DEMAND**: Cache miss scenarios requiring on-demand expert loading (1.7ms avg)
-  - **EXPERT_PREFETCH_LOAD**: Prefetch buffer loading operations (1.7ms avg)
-  - **PREFETCH_HIT**: Cache hit scenarios using prefetched experts (1.3μs avg - very fast!)
-
-### **🔍 EXPERT ACTIVITY ANALYSIS**
-
-**Key Memory Transfer Patterns Captured**:
-1. **Expert Prefetching**: Host-to-Device transfers show expert loading patterns
-2. **Expert Fetching on Miss**: Additional on-demand loading when prefetch fails
-3. **Transfer Volume**: ~4,400 memory operations in prediction mode vs ~4,100 in collection
-4. **Transfer Performance**: Average 520μs per Host-to-Device transfer
-
-### **📊 ANALYSIS COMMANDS**
-
-**GUI Analysis** (recommended for visual inspection of NVTX markers):
-```bash
-nsight-sys qwen_prefetch_profile_20250925_210726/qwen_prefetch_collection.nsys-rep
-nsight-sys qwen_prefetch_profile_20250925_210726/qwen_prefetch_prediction.nsys-rep
-```
-
-**NVTX Marker Analysis**:
-```bash
-# View all expert-related NVTX markers in prediction mode
-nsys stats --report nvtx_sum qwen_prefetch_profile_20250925_210726/qwen_prefetch_prediction.nsys-rep
-
-# Memory transfer analysis
-nsys stats --report cuda_gpu_mem_time_sum qwen_prefetch_profile_20250925_210726/qwen_prefetch_prediction.nsys-rep
-```
-
-### **🎯 Implementation Enhanced**
-
-Added comprehensive NVTX instrumentation to `src/fiddler/qwen_with_prefetch.py`:
-- ✅ `PREFETCH_HIT`: Markers when experts are used from prefetch cache
-- ✅ `EXPERT_LOAD_ON_DEMAND`: Markers when experts must be loaded on-demand
-- ✅ `EXPERT_PREFETCH_TRIGGER`: Markers when prefetch is triggered for future layers
-- ✅ `EXPERT_PREFETCH_LOAD`: Markers during actual expert loading into buffers
-
-**NVTX Markers Successfully Integrated**:
-- **EXPERT_PREFETCH_TRIGGER**: Clearly shows when prefetch is triggered for layer+2 (visible in timeline)
-- **EXPERT_LOAD_ON_DEMAND**: Highlights cache misses requiring on-demand expert loading
-- **EXPERT_PREFETCH_LOAD**: Shows actual prefetch buffer loading operations
-- **PREFETCH_HIT**: Displays cache hits using prefetched experts (very fast ~1.3μs)
-- All markers now **visible in Nsight Systems GUI** for detailed timeline analysis
-
-## Previous Goal (COMPLETED)
-
-## ✅ Previous GOAL ACHIEVED: Prefetch Output Matching Fixed
-
-**Status**: ✅ **SUCCESSFULLY FIXED** - Prefetch implementation now generates correct output matching baseline
-
-The prefetch implementation in `qwen_with_prefetch.py` was producing incorrect outputs compared to the baseline. This has been **completely resolved** by fixing two critical issues:
-
-### 🔧 **Root Cause Analysis and Fixes:**
-
-1. **Missing Router Logits in Return Value**:
-   - **Issue**: Prefetch version was only returning `final_hidden_states` instead of the expected tuple `(final_hidden_states, router_logits)`
-   - **Fix**: Added proper router logits return to match baseline format: `return final_hidden_states, router_logits`
-
-2. **Incorrect MoE Processing Logic**:
-   - **Issue**: Prefetch version used simplified expert processing logic that differed from baseline
-   - **Fix**: Replaced entire `_moe_forward_with_management` method with baseline-matching logic including:
-     - Proper expert mask computation using `torch.nn.functional.one_hot(...).permute(2, 1, 0)`
-     - Correct active expert finding with `torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()`
-     - Baseline-matching tensor reshaping and device handling
-     - Proper shared expert gate mechanism: `shared_expert_gate * shared_expert_output`
-
-### ✅ **Verification Results:**
-- **Expected Output**: `"The capital of France is ______.\nParis\nLondon\nBerlin\nRome\n答案:\nA"`
-- **Baseline Output**: ✅ **MATCHES**: `"The capital of France is ______.\nParis\nLondon\nBerlin\nRome\n答案:\nA"`
-- **Prefetch Output**: ✅ **MATCHES**: `"The capital of France is ______.\nParis\nLondon\nBerlin\nRome\n答案:\nA"`
-
-**Performance Results:**
-- Baseline: 2.96s ± 0.27s
-- Prefetch: 4.45s ± 0.19s (hit rate: 13.2%)
-- Both implementations produce **identical correct output**
-
-
-## ✅ GOAL ACHIEVED: Qwen Prefetch Implementation Fixed
-
-**Status**: ✅ **SUCCESSFULLY IMPLEMENTED** - Prefetch system now using experts directly
-
-The implementation of `src/fiddler/qwen_with_prefetch.py` has been fixed to actually perform prefetching of experts and use them directly without on-demand fetching when they were already prefetched.
-
-**🎯 IMPLEMENTATION COMPLETED**:
-- ✅ Fixed `_moe_forward_with_management` to use prefetch-aware expert selection
-- ✅ Implemented proper prefetch cache checking with `_is_expert_prefetched`
-- ✅ Added prefetch hit/miss metrics tracking
-- ✅ Fixed token position advancement during generation
-- ✅ Verified with simple_perf_test.py showing 80.4% hit rate (reasonable performance)
-
-**Technical Changes Made**:
-1. **Enhanced MoE Forward**: Replaced dummy call to parent method with full prefetch-aware implementation
-2. **Expert Selection Logic**: Added conditional logic to use prefetched experts when available vs on-demand loading
-3. **Metrics Integration**: Proper tracking of prefetch hits/misses with detailed statistics
-4. **Token Position Management**: Fixed token advancement to work correctly with generation loop
-5. **Prefetch Triggering**: Layer+2 prefetch triggering integrated into forward pass
-
-
-## ✅ GOAL ACHIEVED: CPU-to-GPU Expert Management Implementation Complete
-
-**Status**: ✅ **SUCCESSFULLY IMPLEMENTED** - All model components except experts now on GPU
-
-Our goal was to modify qwen.py so that all of the model except the experts are on the GPU, then the experts are loaded on-demand to a GPU buffer that can hold a single expert from the CPU to the GPU and are executed there.
-
-**🎯 IMPLEMENTATION COMPLETED**:
-- ✅ Non-expert layers moved to GPU (embeddings, attention, normalization, gates, shared experts)
-- ✅ Experts remain on CPU and are loaded on-demand to single GPU buffer
-- ✅ Correct output maintained: `"The capital of France is ______.\nParis\nLondon"`
-- ✅ Expert hit rate: 100% (proper expert buffer management)
-- ✅ Device placement verified: Architecture matches goal exactly
-
-## ✅ ISSUE RESOLVED: MoE Forward Implementation Fixed
-
-**Status**: ✅ **SUCCESSFULLY IMPLEMENTED** - Expert management with correct outputs
-
-Our goal was to have qwen.py implement a system where all of the model except the experts are on the GPU then the experts are loaded on-demand to a GPU buffer that can hold a single expert from the CPU to the GPU and are executed there.
-
-### ✅ **IMPLEMENTATION COMPLETED**
-
-**Expected Output**: `"The capital of France is ______.\nParis\nLondon\nBerlin\nRome\n答案:\nA"`
-**Current Output**: ✅ **MATCHES EXPECTED**: `"The capital of France is ______.\nParis\nLondon\nBerlin\nRome\n答案:\nA"`
-
-### 🎯 **SOLUTION IMPLEMENTED**
-
-Successfully implemented proper MoE forward with expert management:
-
-1. **✅ Model works correctly with hooks**: Full MoE implementation produces expected output
-2. **✅ Expert management functional**: CPU-to-GPU expert loading working (100% hit rate tracking)
-3. **✅ MoE forward implementation complete**: `_moe_forward_with_management` method correctly implemented
-4. **✅ Expert buffer mechanism working**: Expert loading, caching, and device transfers functional
-5. **✅ Device placement correct**: CPU model + GPU expert buffers working as intended
-
-### ✅ **IMPLEMENTATION DETAILS**
-
-**Successful Test Results:**
-- `python simple_perf_test.py`: ✅ Correct output with expert management
-- Baseline performance: ~4.05s (slower than workaround due to actual CPU-GPU transfers)
-- Expert hit rate: 100% (indicating proper expert caching)
-- Output identical to expected format
-
-**Key Implementation Features**:
-- **Step-by-step MoE forward**: Based on debug_moe.py validation (outputs matched exactly)
-- **Dtype precision handling**: Careful dtype conversion to prevent accumulation precision loss
-- **Device management**: Proper CPU-GPU transfers with device consistency checks
-- **Expert buffer system**: Single GPU buffer with CPU expert loading on-demand
-- **Statistics tracking**: Hit rates and expert fetch counting implemented
-
-**Files Implemented**:
-- ✅ `src/fiddler/qwen.py:126` - `_moe_forward_with_management` method (fully implemented)
-- ✅ `src/fiddler/qwen.py:216` - `_get_expert_for_execution` method (working correctly)
-
-**Implementation Strategy Used**:
-1. ✅ **Analyzed debug_moe.py**: Validated step-by-step MoE implementation (exact output match)
-2. ✅ **Implemented proper MoE forward**: Router computation, expert selection, GPU loading, accumulation
-3. ✅ **Added dtype precision guards**: Prevented precision loss during CPU-GPU expert accumulation
-4. ✅ **Device transfer management**: Proper handling of CPU (model) to GPU (experts) to CPU (final) workflow
-5. ✅ **Maintained exact MoE semantics**: One-hot encoding, index_add accumulation, shared expert processing
-
-**Success Criteria Met**:
-- ✅ `python simple_perf_test.py` produces correct output: `"The capital of France is ______.\nParis..."`
-- ✅ Experts remain on CPU with on-demand GPU loading (expert buffer system working)
-- ✅ Expert statistics tracking works (hit rates: 100%, fetch counts tracked)
-
-## Current Focus: MoE Expert Memory Optimization through prefetching
-
-
-## ✅ COMPLETED: CPU-to-GPU Expert Management Implementation
-
-**Status**: Core CPU-to-GPU expert management has been successfully implemented with proper architecture.
-
-### **✅ Architecture Successfully Implemented**
-- **Baseline (`qwen.py`)**: Experts stored on CPU, loaded to GPU buffer on-demand ✅
-- **Expert Movement**: All 60 experts × 24 layers successfully moved from GPU to CPU during init ✅
-- **GPU Buffer System**: Single expert buffer on GPU with proper state management ✅
-- **On-Demand Loading**: CPU experts loaded to GPU buffer when needed ✅
-- **MoE Logic**: Exact Qwen MoE implementation (one-hot encoding, index_add, shared expert) ✅
-
-### **✅ Technical Implementation Verified**
-- **Meta tensor handling**: Properly handles `device_map="auto"` tensors with `to_empty()` ✅
-- **Expert routing**: Router logits match original exactly ✅
-- **Expert processing**: All active experts processed correctly (verified 16/60 active) ✅
-- **Buffer management**: Expert loading/caching works with proper hit/miss tracking ✅
-
-### **✅ FIXED: Expert Accumulation Precision Issue**
-**Status**: Root cause identified and fixed successfully
-
-**✅ SYMPTOMS RESOLVED**:
-- Expected: `"The capital of France is ______.\nParis"`
-- **✅ FIXED**: Now produces correct output: `"The capital of France is ______.\nParis"`
-
-**🎯 ROOT CAUSE IDENTIFIED AND FIXED**:
-- **Issue**: Dtype conversion precision loss in expert output accumulation
-- **Location**: Line 215 in `qwen.py`: `final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))`
-- **Problem**: Expert computations in float32 converted to bfloat16 during accumulation, causing precision loss of ~0.03125 per expert
-- **Impact**: Small per-expert precision losses accumulated across 60 experts × 24 layers, resulting in significant output corruption
-
-**🔧 IMPLEMENTED FIX**:
-1. **Expert buffer dtype consistency**: Expert buffer created with explicit dtype matching model dtype (bfloat16)
-2. **State dict dtype conversion**: All expert weights converted to target dtype during CPU→GPU loading
-3. **Accumulation dtype guard**: Added explicit dtype check before accumulation to prevent precision loss
-4. **Result**: CPU-GPU approach now produces identical output to GPU-only approach
-
-## ✅ COMPLETED: Priority 1 Tasks
-
-### **✅ COMPLETED: Fix Expert Accumulation Logic**
-**Status**: Successfully completed with dtype precision fix
-1. **✅ Investigated accumulation precision**: Identified dtype conversion as root cause (0.03125 precision loss)
-2. **✅ Compared accumulation order**: Confirmed order is identical between CPU-GPU and GPU-only
-3. **✅ Fixed tensor device mismatches**: Ensured dtype consistency throughout expert pipeline
-4. **✅ Implemented fix**: Modified expert buffer creation and accumulation to prevent precision loss
-
-**Result**: CPU-GPU baseline now generates correct output matching expected: `"The capital of France is ______.\nParis"`
-
-## ✅ **COMPLETED: Priority 1 - Prefetch Version Implementation**
-
-### **✅ Priority 1: Implement Prefetch Version** (COMPLETED)
-**Prerequisites**: ✅ Baseline produces correct output
-1. **✅ Updated `qwen_with_prefetch.py`**: Applied same dtype precision fixes from baseline
-   - Expert buffer creation with explicit dtype consistency (`dtype=self.dtype`)
-   - Dtype conversion guards for accumulation operations
-   - State dict loading with correct dtype conversion
-2. **✅ Implemented 2-layer-ahead prefetching**: Based on `mixtral_with_prefetch.py` pattern
-   - Added token position advancement logic at end of last MoE layer
-   - Integrated prefetch trigger mechanism for layer+2 prediction
-   - Added proper bounds checking for target layers
-3. **✅ Added prefetch buffers**: Multiple GPU buffers for predicted experts (top-k=4 for Qwen)
-   - Created 4 prefetch buffers per MoE layer matching Qwen's top-k=4
-   - Implemented proper buffer initialization and management
-   - Added prefetch cache for expert lookup with safety checks
-
-**✅ Output Verification**: Prefetch version generates correct output matching baseline: `"The capital of France is ______.\nParis"`
-
-## 🎯 NEXT STEPS
-
-### **Priority 2: Performance Analysis and Optimization** (READY TO PROCEED)
-**Prerequisites**: ✅ Both baseline and prefetch versions produce correct output
-1. **Enable full prefetch logic**: Re-enable prefetch prediction and expert loading
-2. **Performance comparison**: Measure speedup of prefetching vs baseline fiddler approach
-3. **Hit rate analysis**: Analyze prefetch effectiveness and pattern learning
-4. **Memory transfer optimization**: Measure impact of reduced CPU-GPU transfers
-
-### **Debugging Resources Available**
-- `debug_moe.py`: Proves MoE logic is correct in isolation
-- Expert movement working correctly (all layers processed)
-- Statistics show proper expert routing/loading
-
-**Current branch**: `predictor_vs_fiddler`
-**Key files**: `src/fiddler/qwen.py`, `src/fiddler/qwen_with_prefetch.py`
-
-## ✅ **COMPLETED: Qwen MoE Experiments**
-
-**Qwen MoE experiments successfully implemented and validated!**
-
-The requested experiments comparing fiddler and prefetching approaches on Qwen model have been completed with working implementations that generate correct output and demonstrate prefetch effectiveness.
+The Fiddler MoE optimization project has successfully implemented and benchmarked expert prefetching for Qwen1.5-MoE-A2.7B. Both baseline and prefetch implementations generate correct outputs and achieve significant speedup through async expert loading.
 
 **Primary Branch**: `predictor_vs_fiddler`
 
-## 🎯 **Project Status**
+**Architecture**: CPU-to-GPU expert management with pattern-based prefetching
+- Model layers on GPU, experts on CPU (pinned memory)
+- Single expert buffer for baseline on-demand loading
+- Dual buffer system (A/B) for prefetch with async transfers
+- Layer+2 prefetch prediction based on learned token-position patterns
 
-✅ **COMPLETED**: Qwen MoE experiments with fiddler vs prefetching comparison
-- Both implementations generate correct output: "The capital of France is ______. Paris"
-- Prefetch system achieves 29.2% hit rate after pattern learning
-- Ready for detailed performance analysis and speedup measurement
+## 📊 Latest Benchmark Results (Prefill vs Decode Analysis)
 
-**Architecture**: Qwen1.5-MoE with device_map="auto" + expert management layer
-- All experts managed through transformers' native device placement
-- Expert usage tracking and prediction implemented
-- Pattern collection and prefetch prediction working
+**Benchmark**: `prefetch_benchmark_20251006_234734/`
 
-## 🏗️ **Key Implementations**
+### Baseline Performance (No Prefetch)
+- **Prefill**: 0.404s
+- **Decode**: 1.522s
+- **Total**: 2.036s
 
-### **Core Models** (`src/fiddler/`)
-- `mixtral.py` - **Baseline Fiddler implementation** (production ready)
-- `mixtral_with_prefetch.py` - **Prefetch with memory bug** (1.01x speedup but inefficient)
-- `mixtral_with_buffers.py` - **Multi-buffer approach**
+### Optimal Configurations (0-16 Experts Tested)
 
-### **✅ NEW: Qwen MoE Implementations**
-- `qwen.py` - **✅ WORKING: Baseline Fiddler implementation for Qwen MoE**
-  - Uses device_map="auto" for correct device placement
-  - Expert management tracking layer
-  - Generates correct output, validated with quick_test.py
-- `qwen_with_prefetch.py` - **✅ WORKING: Prefetch implementation for Qwen MoE**
-  - Collection mode: Records expert usage patterns → `expert_usage_patterns_qwen.json`
-  - Prediction mode: Achieves 29.2% prefetch hit rate
-  - Extends working baseline with pattern learning
+**Best Overall Performance:**
+1. **8 experts**: 2.889x total speedup
+   - Prefill: 1.136x (0.356s)
+   - Decode: 4.842x (0.314s)
+   - Hit rate: 63.5%
 
-### **Research Implementations**
-- `qwen_single_buffer.py` - **Reference implementation** (produces garbled output, not used)
+2. **4 experts**: 2.885x total speedup
+   - Prefill: 1.136x (0.356s)
+   - Decode: 4.818x (0.316s)
+   - Hit rate: 50.8%
 
-## ⚠️ **Critical Test Configuration**
-All testing must use identical settings:
-- `cpu_offload=0`, `max_experts_gpu=0`, `beam_width=1`
+3. **6 experts**: 2.875x total speedup
+   - Prefill: 1.122x (0.360s)
+   - Decode: 4.862x (0.313s)
+   - Hit rate: 57.2%
 
-## 🔧 **Tools & Testing**
+### Key Insights
+- **Prefetching primarily benefits decode phase**: Up to 4.86x speedup
+- **Prefill phase sees modest gains**: ~13% improvement at best
+- **Sweet spot**: 4-8 experts prefetched for optimal performance/memory tradeoff
+- **Diminishing returns**: Beyond 8 experts, overhead outweighs benefits
+- **Why it works**: Async memory transfers overlap with GPU compute, hiding transfer latency
 
-### **Primary Testing Tool**
-- `quick_test.py` - **Fast 3-token generation test** (correctness + performance)
+### Speedup Mechanism
+Transfer/compute overlap is the key to speedup:
+- **Baseline (serial)**: GPU waits for each expert transfer
+- **Prefetch (parallel)**: Experts loaded ahead of time, transfers hidden behind compute
+- **Result**: Critical path dominated by compute, not memory transfers
+
+## 🏗️ Core Implementations
+
+### Model Files (`src/fiddler/`)
+
+**`qwen.py`** - Baseline Fiddler implementation
+- All model layers on GPU except experts (CPU)
+- Single GPU expert buffer for on-demand loading
+- Pinned CPU memory for async transfers
+- Timing tracking for prefill/decode phases
+- Generates correct output, validated
+
+**`qwen_with_prefetch.py`** - Prefetch implementation
+- Extends baseline with pattern-based prefetching
+- Dual buffer system (A/B) for alternating layer prefetch
+- Collection mode: Records expert usage patterns → `expert_usage_patterns_qwen.json`
+- Prediction mode: Prefetches experts based on learned patterns
+- Layer+2 prefetch triggering (prefetch for N+2 while executing N)
+- Async CUDA stream for non-blocking transfers
+- Timing tracking for prefill/decode phases
+
+**Legacy Implementations:**
+- `mixtral.py` - Original Mixtral baseline
+- `mixtral_with_prefetch.py` - Mixtral prefetch version
+- `qwen_single_buffer.py` - Research prototype (not used)
+
+### Benchmarking Tools
+
+**`benchmark_prefetch_configs.py`** - Comprehensive benchmark suite
+- Tests prefetch with 0-16 experts
+- Measures prefill vs decode speedup separately
+- Generates performance plots and CSV results
+- Tracks hit rates and timing statistics
+- Latest run: `prefetch_benchmark_20251006_234734/`
+
+**`quick_test.py`** - Fast validation tool
+- 3-token generation test for correctness
+- Quick performance check
+- Usage:
   ```bash
-  # Test Qwen implementations
   python quick_test.py FiddlerQwen              # Baseline
-  python quick_test.py FiddlerQwenWithPrefetch  # Prefetch (29.2% hit rate)
-
-  # Test Mixtral implementations
-  python quick_test.py FiddlerMixtralWithPrefetch
+  python quick_test.py FiddlerQwenWithPrefetch  # Prefetch
   ```
 
-### **Profiling Infrastructure**
-- `profile_nsight.py` - **Unified Nsight profiling** with `profile_program()` function
-- `profile_qwen_prefetch.py` - **✅ NEW: Qwen prefetch profiling script**
-- `qwen_single_buffer.py` + `profile_single_buffer.py` - **Single buffer validation**
-- **Environment**: `conda env qwen_profiling` (transformers 4.56.2)
+### Profiling Tools
 
-### **Key Results**
-- **✅ Qwen MoE working**: Both baseline and prefetch implementations generate correct output
-- **✅ Prefetch effectiveness**: 29.2% hit rate demonstrates successful pattern learning
-- **✅ Nsight profiling completed**: Collection vs Prediction mode profiles generated
-  - Profile directory: `qwen_prefetch_profile_20250923_163737/`
-  - Collection mode: `qwen_prefetch_collection.nsys-rep` (0% hit rate)
-  - Prediction mode: `qwen_prefetch_prediction.nsys-rep` (29.2% hit rate)
-- **🎯 Ready for analysis**: Can now measure speedup of prefetching vs fiddler approach
-- **Memory dominance**: 35-55% execution time in transfers (from Mixtral analysis)
-- **Prefetch bug**: High hit rate → 2x MORE memory ops (should be fewer) (Mixtral issue)
+**`profile_qwen_prefetch.py`** - Nsight Systems profiling
+- Generates collection vs prediction mode profiles
+- NVTX markers for expert operations
+- Memory transfer analysis
+- Latest profiles: `qwen_prefetch_profile_*/`
 
-## 📋 **Interface Requirements**
+## 🔧 Technical Architecture
+
+### Buffer System
+
+**Baseline (qwen.py):**
+- Single GPU expert buffer (one expert at a time)
+- Expert state dict copied from CPU to buffer on-demand
+- Pinned CPU memory for faster transfers
+
+**Prefetch (qwen_with_prefetch.py):**
+- **Buffer A**: Even MoE layers (0, 2, 4, ...)
+- **Buffer B**: Odd MoE layers (1, 3, 5, ...)
+- Configurable slots per buffer (num_experts_to_prefetch)
+- Async prefetch stream separate from compute stream
+- Prefetch cache tracking: `{(layer_idx, expert_idx): buffer_slot}`
+
+### Prefetch Strategy
+
+**Collection Mode** (first run):
+- Records expert usage per token position
+- Pattern file: `expert_usage_patterns_qwen.json`
+- Structure: `token_pos → layer_id → [expert_ids]`
+
+**Prediction Mode** (subsequent runs):
+- Predicts needed experts based on token position
+- Prefetches top-k experts for layer N+2 during layer N execution
+- Async transfer allows GPU to continue computing
+- Cache lookup before on-demand loading
+
+### Timing and Hit Rate Tracking
+
+Both implementations track MoE layer execution time and hit rates by phase:
+- **Prefill phase**: `sequence_length > 1` (initial prompt processing)
+- **Decode phase**: `sequence_length == 1` (autoregressive generation)
+- Times accumulated across all MoE layers
+- Hit rates tracked separately for prefill and decode phases
+- Returned from `generate()`: `(prefill_time, decode_time, prefill_hit_rate, decode_hit_rate)`
+
+## 📋 Interface Requirements
 
 All implementations must support:
 ```python
@@ -577,27 +160,61 @@ class YourImplementation:
         # Initialize model
 
     def generate(self, text, output_token=20, input_token=None):
-        # Return (prefill_time, decode_time, expert_hit_rate)
+        # Return (prefill_time, decode_time, prefill_hit_rate, decode_hit_rate)
 
     def tokenize(self, text):
-        # Return (input_ids, position_ids) - same as baseline
+        # Return (input_ids, position_ids)
 
     def mixtral_forward(self, input_ids, position_ids, is_decode):
         # Core inference - return logits tensor
 ```
 
-## ⚠️ **Critical Notes**
+## ⚠️ Critical Notes
 
-### **Testing Requirements**
-- **✅ Qwen implementations**: Both work correctly with quick_test.py
-- **MixtralWithBuffers**: Delete `expert_usage_patterns.json` before testing
-- **QwenWithPrefetch**: Uses `expert_usage_patterns_qwen.json` for pattern storage
-- **Correctness**: Forward pass logits must match baseline within tolerance ✅
-- **Memory**: Use `torch.cuda.empty_cache()` between model loads
+### Testing Configuration
+All testing must use identical settings:
+- `cpu_offload=0`
+- `max_experts_gpu=0`
+- `beam_width=1`
 
-## 🚀 **Usage Instructions**
+### Memory Management
+- Use `torch.cuda.empty_cache()` between model loads
+- Pinned CPU memory required for async transfers
+- Expert parameters pinned during initialization
 
-### **Testing Qwen Implementations**
+### Pattern Files
+- Baseline: No pattern file needed
+- Prefetch: Uses `expert_usage_patterns_qwen.json`
+- First run (collection mode) generates pattern file
+- Subsequent runs (prediction mode) use learned patterns
+
+### Correctness Verification
+- Expected output: `"The capital of France is ______.\nParis\nLondon\nBerlin\nRome\n答案:\nA"`
+- Both baseline and prefetch produce identical outputs
+- Forward pass logits match within dtype tolerance
+
+### Key Implementation Details
+- **Dtype consistency**: Expert buffers created with `dtype=self.dtype` (bfloat16)
+- **Precision fix**: Explicit dtype conversion before accumulation prevents precision loss
+- **MoE semantics**: One-hot expert masking, index_add accumulation, shared expert
+- **GPU-resident layers**: Layers 0-1 kept on GPU permanently for efficiency
+
+## 🚀 Usage Instructions
+
+### Running Benchmarks
+
+```bash
+# Full benchmark: 0-16 experts with prefill/decode analysis
+python benchmark_prefetch_configs.py
+
+# Results saved to: prefetch_benchmark_YYYYMMDD_HHMMSS/
+# - benchmark_results.csv: Detailed timing data
+# - benchmark_summary.json: Full results with baseline
+# - prefetch_speedup_analysis.png: Visualization plots
+```
+
+### Quick Testing
+
 ```bash
 # Test baseline
 python quick_test.py FiddlerQwen
@@ -606,16 +223,45 @@ python quick_test.py FiddlerQwen
 python quick_test.py FiddlerQwenWithPrefetch
 ```
 
-### **Profiling Qwen Prefetch**
+### Profiling
+
 ```bash
-# Generate Nsight profiles for collection vs prediction modes
+# Generate Nsight profiles
 python profile_qwen_prefetch.py
 
-# Analyze results
+# Analyze with Nsight Systems GUI
 nsight-sys qwen_prefetch_profile_*/qwen_prefetch_collection.nsys-rep
 nsight-sys qwen_prefetch_profile_*/qwen_prefetch_prediction.nsys-rep
+
+# Command-line stats
+nsys stats --report nvtx_sum qwen_prefetch_profile_*/qwen_prefetch_prediction.nsys-rep
 ```
+
+## 📁 Important Files Modified
+
+### Core Implementation
+- `src/fiddler/qwen.py` - Baseline with prefill/decode timing and hit rates
+  - Returns separate hit rates for prefill and decode (same value for both in baseline)
+- `src/fiddler/qwen_with_prefetch.py` - Prefetch with prefill/decode timing and hit rates
+  - Added `get_prefill_hit_rate()` method to `PrefetchMetrics` class
+  - Phase tracking in `_moe_forward_with_management()` using `metrics.set_phase()`
+  - `generate()` returns separate `prefill_hit_rate` and `decode_hit_rate`
+  - `get_prefetch_stats()` includes separate hit rate metrics
+
+### Benchmarking
+- `benchmark_prefetch_configs.py` - Updated for separate prefill/decode analysis
+  - Modified `run_baseline()` to return separate hit rates
+  - Modified `run_prefetch_config()` to return separate hit rates
+  - Updated `plot_results()` with 3-panel visualization including separate hit rate plot
+  - Enhanced summary output with phase-specific rankings and hit rates
+  - CSV and JSON outputs include separate hit rate columns
+
+### Results
+- `prefetch_benchmark_20251006_234734/` - Latest benchmark results
+  - `benchmark_results.csv` - Per-config timing data
+  - `benchmark_summary.json` - Full results
+  - `prefetch_speedup_analysis.png` - Visualization
 
 ---
 
-**✅ Updated**: Guide reflects completed Qwen MoE experiment implementation with working baseline and prefetch systems.
+**✅ Status**: Prefill/decode speedup and hit rate analysis completed. System achieves up to 4.86x decode speedup and 1.14x prefill speedup with 4-8 experts prefetched. Hit rates are now tracked separately for prefill and decode phases.

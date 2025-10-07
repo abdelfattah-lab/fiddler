@@ -472,7 +472,9 @@ class FiddlerQwen:
         print(f"Generated: {generated_text}")
         print(f"⏱️  Prefill: {prefill_time:.3f}s, Decode: {decode_time:.3f}s")
 
-        return (prefill_time, decode_time, hit_rate)
+        # Return format: (prefill_time, decode_time, prefill_hit_rate, decode_hit_rate)
+        # Baseline doesn't track phase-specific hit rates, so return same rate for both
+        return (prefill_time, decode_time, hit_rate, hit_rate)
 
     def tokenize(self, text):
         """Tokenize text - for interface compatibility."""

@@ -101,6 +101,13 @@ class PrefetchMetrics:
             return 0.0
         return self.prefetch_hits / self.total_expert_requests
 
+    def get_prefill_hit_rate(self):
+        """Get prefill-phase prefetch hit rate."""
+        total_prefill = self.prefill_hits + self.prefill_misses
+        if total_prefill == 0:
+            return 0.0
+        return self.prefill_hits / total_prefill
+
     def get_decode_hit_rate(self):
         """Get decode-phase prefetch hit rate."""
         total_decode = self.decode_hits + self.decode_misses
@@ -243,6 +250,9 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
 
         # Determine if we're in prefill (sequence_length > 1) or decode (sequence_length == 1) phase
         is_prefill = sequence_length > 1
+
+        # Set the phase in metrics tracker
+        self.metrics.set_phase("prefill" if is_prefill else "decode")
 
         hidden_states_flat = hidden_states.view(-1, hidden_dim)
 
@@ -609,7 +619,9 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
 
         # Calculate hit rates
         baseline_hit_rate = self.cnt_expert_hit / self.cnt_expert_all if self.cnt_expert_all > 0 else 0.0
-        prefetch_hit_rate = self.metrics.get_hit_rate()
+        overall_hit_rate = self.metrics.get_hit_rate()
+        prefill_hit_rate = self.metrics.get_prefill_hit_rate()
+        decode_hit_rate = self.metrics.get_decode_hit_rate()
 
         # Store for comparison
         self.last_generated_text = generated_text
@@ -624,20 +636,23 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         decode_time = self.decode_time
 
         print(f"Generated: {generated_text}")
-        print(f"🎯 Prefetch hit rate: {prefetch_hit_rate:.1%}")
+        print(f"🎯 Prefetch hit rate - Overall: {overall_hit_rate:.1%}, Prefill: {prefill_hit_rate:.1%}, Decode: {decode_hit_rate:.1%}")
         print(f"⏱️  Prefill: {prefill_time:.3f}s, Decode: {decode_time:.3f}s")
 
-        # Return prefetch hit rate instead of baseline hit rate
-        return (prefill_time, decode_time, prefetch_hit_rate)
+        # Return separate hit rates for prefill and decode
+        return (prefill_time, decode_time, prefill_hit_rate, decode_hit_rate)
 
     def get_prefetch_stats(self):
         """Get detailed prefetch statistics."""
         return {
             'overall_hit_rate': self.metrics.get_hit_rate(),
+            'prefill_hit_rate': self.metrics.get_prefill_hit_rate(),
             'decode_hit_rate': self.metrics.get_decode_hit_rate(),
             'total_requests': self.metrics.total_expert_requests,
             'prefetch_hits': self.metrics.prefetch_hits,
             'prefetch_misses': self.metrics.prefetch_misses,
+            'prefill_hits': self.metrics.prefill_hits,
+            'prefill_misses': self.metrics.prefill_misses,
             'decode_hits': self.metrics.decode_hits,
             'decode_misses': self.metrics.decode_misses
         }
