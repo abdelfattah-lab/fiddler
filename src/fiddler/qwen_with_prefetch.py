@@ -233,10 +233,17 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
 
     def _moe_forward_with_management(self, hidden_states, layer_idx):
         """Enhanced MoE forward with prefetch prediction and CPU-to-GPU loading (matching baseline logic)."""
+        # Start timing for this layer
+        layer_start_time = time.time()
+
         moe_layer = self.model.model.layers[layer_idx].mlp
 
         # Get dimensions
         batch_size, sequence_length, hidden_dim = hidden_states.shape
+
+        # Determine if we're in prefill (sequence_length > 1) or decode (sequence_length == 1) phase
+        is_prefill = sequence_length > 1
+
         hidden_states_flat = hidden_states.view(-1, hidden_dim)
 
         # Router computation (same as baseline)
@@ -361,6 +368,14 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
 
         # Return in the same format as original forward (output, router_logits)
         router_logits = router_logits.view(batch_size, sequence_length, -1)
+
+        # Track timing
+        layer_time = time.time() - layer_start_time
+        if is_prefill:
+            self.prefill_time += layer_time
+        else:
+            self.decode_time += layer_time
+
         return final_hidden_states.view(batch_size, sequence_length, hidden_dim), router_logits
 
 
@@ -564,6 +579,10 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         if not self.collection_mode:
             self.profiler.current_token_pos = 0
 
+        # Reset timing statistics
+        self.prefill_time = 0.0
+        self.decode_time = 0.0
+
         start_time = time.time()
 
         with torch.no_grad():
@@ -599,12 +618,14 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         if self.collection_mode:
             self.save_expert_patterns()
 
-        # For now, approximate prefill vs decode timing
-        prefill_time = total_time * 0.3  # Rough approximation
-        decode_time = total_time * 0.7
+        # Use actual measured times from MoE layer tracking
+        # Note: self.prefill_time and self.decode_time are accumulated across all MoE layers
+        prefill_time = self.prefill_time
+        decode_time = self.decode_time
 
         print(f"Generated: {generated_text}")
         print(f"🎯 Prefetch hit rate: {prefetch_hit_rate:.1%}")
+        print(f"⏱️  Prefill: {prefill_time:.3f}s, Decode: {decode_time:.3f}s")
 
         # Return prefetch hit rate instead of baseline hit rate
         return (prefill_time, decode_time, prefetch_hit_rate)

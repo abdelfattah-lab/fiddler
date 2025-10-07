@@ -137,6 +137,11 @@ class FiddlerQwen:
         self.cnt_expert_all = 0
         self.current_expert = None  # Track which expert is loaded in buffer
 
+        # Timing statistics for prefill vs decode
+        self.prefill_time = 0.0
+        self.decode_time = 0.0
+        self.is_first_forward = True  # Track if we're in prefill phase
+
         print("✅ Expert management ready")
 
     def _pin_cpu_experts(self):
@@ -180,14 +185,27 @@ class FiddlerQwen:
 
     def _moe_forward_with_management(self, hidden_states, layer_idx):
         """MoE forward with expert management and CPU-to-GPU loading."""
+        # Start timing for this layer
+        layer_start_time = time.time()
+
         moe_layer = self.model.model.layers[layer_idx].mlp
 
         # Get dimensions
         batch_size, sequence_length, hidden_dim = hidden_states.shape
 
+        # Determine if we're in prefill (sequence_length > 1) or decode (sequence_length == 1) phase
+        is_prefill = sequence_length > 1
+
         # Fiddler mode: execute on CPU for small batches
         if self.use_fiddler_mode and batch_size < self.fiddler_batch_threshold:
-            return self._moe_forward_cpu(hidden_states, layer_idx, moe_layer, batch_size, sequence_length, hidden_dim)
+            result = self._moe_forward_cpu(hidden_states, layer_idx, moe_layer, batch_size, sequence_length, hidden_dim)
+            # Track timing
+            layer_time = time.time() - layer_start_time
+            if is_prefill:
+                self.prefill_time += layer_time
+            else:
+                self.decode_time += layer_time
+            return result
 
         hidden_states_flat = hidden_states.view(-1, hidden_dim)
 
@@ -271,6 +289,14 @@ class FiddlerQwen:
 
         # Return in the same format as original forward (output, router_logits)
         router_logits = router_logits.view(batch_size, sequence_length, -1)
+
+        # Track timing
+        layer_time = time.time() - layer_start_time
+        if is_prefill:
+            self.prefill_time += layer_time
+        else:
+            self.decode_time += layer_time
+
         return final_hidden_states, router_logits
 
     def _moe_forward_cpu(self, hidden_states, layer_idx, moe_layer, batch_size, sequence_length, hidden_dim):
@@ -412,6 +438,10 @@ class FiddlerQwen:
         self.cnt_expert_all = 0
         self.current_expert = None
 
+        # Reset timing statistics
+        self.prefill_time = 0.0
+        self.decode_time = 0.0
+
         start_time = time.time()
 
         with torch.no_grad():
@@ -434,11 +464,13 @@ class FiddlerQwen:
         # Store for comparison
         self.last_generated_text = generated_text
 
-        # For now, approximate prefill vs decode timing
-        prefill_time = total_time * 0.3  # Rough approximation
-        decode_time = total_time * 0.7
+        # Use actual measured times from MoE layer tracking
+        # Note: self.prefill_time and self.decode_time are accumulated across all MoE layers
+        prefill_time = self.prefill_time
+        decode_time = self.decode_time
 
         print(f"Generated: {generated_text}")
+        print(f"⏱️  Prefill: {prefill_time:.3f}s, Decode: {decode_time:.3f}s")
 
         return (prefill_time, decode_time, hit_rate)
 

@@ -4,6 +4,75 @@
 
 Always update guide.md to prepare it for another agent to look at it and understand the full state of the system and keep it concise. At the end of that, add all files changed (that are relevant) including guide.md to git and suggest a commit message but let me do the git commit.
 
+## Current Goal
+
+**STATUS**: ✅ FULLY RESOLVED - Prefetching achieves **2.69x speedup**!
+
+### 🎯 FINAL CORRECTED ANALYSIS
+
+**Issue Found**: Profiling measured total execution time (10-11s) including initialization, not just inference time (1-2s) like benchmark does.
+
+**Solution**: Direct timing measurement matching benchmark methodology revealed the TRUE speedup.
+
+### ✅ Confirmed Results
+
+**Direct Inference Timing** (matching benchmark):
+
+| Config | Inference Time | Speedup | Hit Rate | Profile Transfers | Profile Mem Time |
+|--------|---------------|---------|----------|------------------|-----------------|
+| **0 experts** | 1.9138s | 1.0x | 8.5% | 5,447 | 1.93s |
+| **6 experts** | 0.7117s | **2.69x** ✅ | 56.5% | 8,899 (+63%) | 2.99s (+55%) |
+
+**Benchmark Results**: 6 experts = **2.88x speedup** (matches our 2.69x!)
+
+### 🔑 Key Discovery: Why Speedup Despite More Transfers?
+
+**The Paradox**: 6 experts has:
+- 63% MORE total transfers (8,899 vs 5,447)
+- 55% MORE total transfer time (2.99s vs 1.93s)
+- But **2.69x FASTER inference!**
+
+**The Answer**: **Transfer/Compute Overlap**
+
+**0 Experts (Serial - 1.91s)**:
+```
+Compute → WAIT for transfer → Compute → WAIT → Compute
+```
+- Every expert transfer blocks the GPU
+- Critical path = Compute + Transfers (serial)
+
+**6 Experts (Parallel - 0.71s)**:
+```
+Compute Token N  ||  Prefetch for Token N+2
+```
+- Transfers overlap with compute (hidden cost)
+- 56.5% hit rate = most experts already on GPU
+- Critical path ≈ Compute only (transfers hidden)
+
+**Result**: Eliminated ~1.2s of waiting → **2.69x speedup!**
+
+### Why Profiling Was Misleading
+
+**What I measured initially**:
+- Total CUDA API time: 10.75s → 11.15s (3.7% slower)
+- Includes 8-9s initialization overhead
+- Extra init for prefetch buffers masked the speedup
+
+**What benchmark measures**:
+- Pure inference time: 1.91s → 0.71s (2.69x faster)
+- Isolates actual inference performance
+- Shows true speedup from overlap
+
+**Conclusion**:
+- ✅ **Prefetching WORKS** - 2.69x speedup confirmed!
+- ✅ **Overlap is the key** - transfers hidden behind compute
+- ✅ **Hit rate matters** - 56.5% hit rate enables the speedup
+- ✅ **Profiling shows WHERE** (overlap), **benchmark shows HOW MUCH** (2.69x)
+
+**Detailed Analysis**: `speedup_analysis.md`
+
+## Previous steps
+
 ## ✅ COMPLETED: Parallel Memory Compute Demonstration
 
 **Status**: ✅ **SUCCESSFULLY COMPLETED** - Fixed and profiled parallel memory compute workload
