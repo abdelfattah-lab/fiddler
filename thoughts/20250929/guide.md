@@ -6,6 +6,10 @@ Always update guide.md to prepare it for another agent to look at it and underst
 
 ## Current Goal
 
+You're an expert researcher and software engineer and can get tasks done very efficiently. I want to fix the fact that 4+ experts prefetched have different output than other configurations in prefetch_qwen. I also want to resolve the prefetch hit rate. Ideally, you would be able to resolve those while maintaining the high speedup achieved at those configurations. Validate everything and do your best to get this right.
+
+## Completed Steps
+
 ✅ COMPLETED: Separate prefill and decode hit rate tracking has been implemented. Both `qwen.py` and `qwen_with_prefetch.py` now return separate hit rates for prefill and decode phases.
 
 ## 🎯 Project Status
