@@ -452,6 +452,7 @@ class FiddlerQwen:
                 max_new_tokens=output_token,
                 do_sample=False,
                 pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=None,  # Force exact token count
                 use_cache=True
             )
 
