@@ -315,8 +315,13 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
                 self.cnt_expert_hit += len(top_x)
             # Check if expert was prefetched, use prefetched version if available
             elif self._is_expert_prefetched(layer_idx, expert_idx):
-                # REMOVED: Event wait - this was the PRIMARY CAUSE of no parallelism
-                # Prefetch runs truly async, GPU will naturally wait when accessing tensor if needed
+                # CRITICAL: Wait for async transfer to complete before using the expert
+                # This ensures correctness while still allowing parallelism (transfer happens
+                # in parallel with previous layer's compute, we only sync when actually needed)
+                cache_key = (layer_idx, expert_idx)
+                if cache_key in self.expert_ready_events:
+                    # Synchronize with the prefetch stream to ensure transfer is complete
+                    self.expert_ready_events[cache_key].synchronize()
 
                 # Use prefetched expert
                 if NVTX_AVAILABLE:
@@ -603,12 +608,15 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
 
             # Generate with the built-in generation method but with cache reset after each token
             # This ensures our hooks are called appropriately
+            # IMPORTANT: Set eos_token_id=None to force exactly output_token generations
+            # This ensures pattern collection captures all token positions for benchmarking
             outputs = self.model.generate(
                 input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=output_token,
                 do_sample=False,
                 pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=None,  # Force exact token count
                 use_cache=True
             )
 

@@ -1,0 +1,197 @@
+{
+  "baseline_prefill_time": 0.40389418601989746,
+  "baseline_decode_time": 2.051887035369873,
+  "baseline_total_time": 2.600346565246582,
+  "baseline_prefill_hit_rate": 1.0,
+  "baseline_decode_hit_rate": 1.0,
+  "timestamp": "20251007_233447",
+  "configs": [
+    {
+      "num_experts": 0,
+      "prefill_time": 0.3696401119232178,
+      "decode_time": 1.911586046218872,
+      "total_time": 2.426223039627075,
+      "speedup": 1.0717673201414617,
+      "prefill_speedup": 1.0926687147627392,
+      "decode_speedup": 1.0733950686805427,
+      "prefill_hit_rate": 0.0921409214092141,
+      "decode_hit_rate": 0.08333333333333333
+    },
+    {
+      "num_experts": 1,
+      "prefill_time": 0.3571445941925049,
+      "decode_time": 1.7011642456054688,
+      "total_time": 2.212123155593872,
+      "speedup": 1.1754980994936906,
+      "prefill_speedup": 1.1308982204619176,
+      "decode_speedup": 1.206166330306088,
+      "prefill_hit_rate": 0.15176151761517614,
+      "decode_hit_rate": 0.3125
+    },
+    {
+      "num_experts": 2,
+      "prefill_time": 0.35907649993896484,
+      "decode_time": 1.666985034942627,
+      "total_time": 2.190490245819092,
+      "speedup": 1.1871071191527869,
+      "prefill_speedup": 1.1248137544187677,
+      "decode_speedup": 1.2308970940704895,
+      "prefill_hit_rate": 0.21138211382113822,
+      "decode_hit_rate": 0.5416666666666666
+    },
+    {
+      "num_experts": 3,
+      "prefill_time": 0.35500335693359375,
+      "decode_time": 1.5980439186096191,
+      "total_time": 2.117637872695923,
+      "speedup": 1.2279467602910465,
+      "prefill_speedup": 1.1377193430186328,
+      "decode_speedup": 1.2839991513844757,
+      "prefill_hit_rate": 0.27100271002710025,
+      "decode_hit_rate": 0.7708333333333334
+    },
+    {
+      "num_experts": 4,
+      "prefill_time": 0.3571302890777588,
+      "decode_time": 1.436868667602539,
+      "total_time": 1.965116262435913,
+      "speedup": 1.3232532929238763,
+      "prefill_speedup": 1.1309435194166817,
+      "decode_speedup": 1.4280268486844463,
+      "prefill_hit_rate": 0.33062330623306235,
+      "decode_hit_rate": 1.0
+    },
+    {
+      "num_experts": 5,
+      "prefill_time": 0.35607051849365234,
+      "decode_time": 1.4418072700500488,
+      "total_time": 1.964160442352295,
+      "speedup": 1.3238972281370178,
+      "prefill_speedup": 1.134309539943273,
+      "decode_speedup": 1.423135448123137,
+      "prefill_hit_rate": 0.3821138211382114,
+      "decode_hit_rate": 1.0
+    },
+    {
+      "num_experts": 6,
+      "prefill_time": 0.35715508460998535,
+      "decode_time": 1.4585604667663574,
+      "total_time": 1.979926347732544,
+      "speedup": 1.3133552004217517,
+      "prefill_speedup": 1.1308650035346728,
+      "decode_speedup": 1.406789147328891,
+      "prefill_hit_rate": 0.4363143631436314,
+      "decode_hit_rate": 1.0
+    },
+    {
+      "num_experts": 7,
+      "prefill_time": 0.35448265075683594,
+      "decode_time": 1.4456512928009033,
+      "total_time": 1.9630892276763916,
+      "speedup": 1.3246196497774476,
+      "prefill_speedup": 1.139390560179929,
+      "decode_speedup": 1.4193512955634047,
+      "prefill_hit_rate": 0.4959349593495935,
+      "decode_hit_rate": 1.0
+    },
+    {
+      "num_experts": 8,
+      "prefill_time": 0.35417866706848145,
+      "decode_time": 1.4399948120117188,
+      "total_time": 1.9610240459442139,
+      "speedup": 1.3260146251773983,
+      "prefill_speedup": 1.1403684738070443,
+      "decode_speedup": 1.424926686022793,
+      "prefill_hit_rate": 0.5528455284552846,
+      "decode_hit_rate": 1.0
+    },
+    {
+      "num_experts": 9,
+      "prefill_time": 0.3578684329986572,
+      "decode_time": 1.4488625526428223,
+      "total_time": 1.969538688659668,
+      "speedup": 1.3202820438202199,
+      "prefill_speedup": 1.1286108211209926,
+      "decode_speedup": 1.416205444489606,
+      "prefill_hit_rate": 0.5934959349593496,
+      "decode_hit_rate": 1.0
+    },
+    {
+      "num_experts": 10,
+      "prefill_time": 0.36156511306762695,
+      "decode_time": 1.4413518905639648,
+      "total_time": 1.9687917232513428,
+      "speedup": 1.3207829627362837,
+      "prefill_speedup": 1.1170717843686244,
+      "decode_speedup": 1.4235850723219443,
+      "prefill_hit_rate": 0.6395663956639567,
+      "decode_hit_rate": 1.0
+    },
+    {
+      "num_experts": 11,
+      "prefill_time": 0.36571574211120605,
+      "decode_time": 1.445014476776123,
+      "total_time": 1.976334810256958,
+      "speedup": 1.3157419237626502,
+      "prefill_speedup": 1.1043937668318422,
+      "decode_speedup": 1.4199768018571715,
+      "prefill_hit_rate": 0.6829268292682927,
+      "decode_hit_rate": 1.0
+    },
+    {
+      "num_experts": 12,
+      "prefill_time": 0.3721494674682617,
+      "decode_time": 1.4398386478424072,
+      "total_time": 1.9790656566619873,
+      "speedup": 1.3139263755566781,
+      "prefill_speedup": 1.0853009914741931,
+      "decode_speedup": 1.4250812328482902,
+      "prefill_hit_rate": 0.7181571815718157,
+      "decode_hit_rate": 1.0
+    },
+    {
+      "num_experts": 13,
+      "prefill_time": 0.3853950500488281,
+      "decode_time": 1.439976453781128,
+      "total_time": 1.993326187133789,
+      "speedup": 1.3045263650429586,
+      "prefill_speedup": 1.0480004503657365,
+      "decode_speedup": 1.4249448523841999,
+      "prefill_hit_rate": 0.7425474254742548,
+      "decode_hit_rate": 1.0
+    },
+    {
+      "num_experts": 14,
+      "prefill_time": 0.38924670219421387,
+      "decode_time": 1.4370853900909424,
+      "total_time": 1.9960930347442627,
+      "speedup": 1.302718119839407,
+      "prefill_speedup": 1.0376303350628653,
+      "decode_speedup": 1.4278114922871943,
+      "prefill_hit_rate": 0.7804878048780488,
+      "decode_hit_rate": 1.0
+    },
+    {
+      "num_experts": 15,
+      "prefill_time": 0.397075891494751,
+      "decode_time": 1.4448049068450928,
+      "total_time": 2.000746488571167,
+      "speedup": 1.2996881814365295,
+      "prefill_speedup": 1.0171712629026146,
+      "decode_speedup": 1.4201827704547445,
+      "prefill_hit_rate": 0.8211382113821138,
+      "decode_hit_rate": 1.0
+    },
+    {
+      "num_experts": 16,
+      "prefill_time": 0.3955550193786621,
+      "decode_time": 1.4391496181488037,
+      "total_time": 2.0013864040374756,
+      "speedup": 1.299272624217293,
+      "prefill_speedup": 1.0210821914340376,
+      "decode_speedup": 1.4257635269425573,
+      "prefill_hit_rate": 0.8617886178861789,
+      "decode_hit_rate": 1.0
+    }
+  ]
+}
