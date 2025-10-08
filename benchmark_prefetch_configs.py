@@ -51,7 +51,7 @@ def run_baseline():
     )
     total_time = time.time() - start_time
 
-    print(f"✅ Baseline completed: {total_time:.3f}s (Prefill: {prefill_time:.3f}s, Decode: {decode_time:.3f}s)")
+    print(f"✅ Baseline completed: {total_time:.3f}s (Prefill: {prefill_time:.3f}s, Decode: {decode_time:.3f}s/token)")
 
     # Cleanup
     del model
@@ -74,7 +74,7 @@ def run_prefetch_config(num_experts, pattern_file_exists):
         # Make sure pattern file exists for prediction mode
         if not pattern_file_exists:
             print("⚠️  Skipping config with 0 experts - need pattern file first")
-            return None, None, None, None
+            return None, None, None, None, None
 
     model = FiddlerQwenWithPrefetch(args, num_experts_to_prefetch=num_experts)
 
@@ -102,7 +102,7 @@ def run_prefetch_config(num_experts, pattern_file_exists):
     )
     total_time = time.time() - start_time
 
-    print(f"✅ Config completed: {total_time:.3f}s (Prefill: {prefill_time:.3f}s, Decode: {decode_time:.3f}s)")
+    print(f"✅ Config completed: {total_time:.3f}s (Prefill: {prefill_time:.3f}s, Decode: {decode_time:.3f}s/token)")
     print(f"   Hit rates - Prefill: {prefill_hit_rate:.1%}, Decode: {decode_hit_rate:.1%}")
 
     # Cleanup
@@ -112,12 +112,12 @@ def run_prefetch_config(num_experts, pattern_file_exists):
     return prefill_time, decode_time, total_time, prefill_hit_rate, decode_hit_rate
 
 
-def plot_results(results, output_dir):
+def plot_results(results, output_dir, output_tokens):
     """Plot speedup vs number of experts prefetched."""
     configs = [r['num_experts'] for r in results]
     speedups = [r['speedup'] for r in results]
     prefill_speedups = [r['prefill_speedup'] for r in results]
-    decode_speedups = [r['decode_speedup'] for r in results]
+    decode_speedups = [r['decode_speedup_per_token'] for r in results]
     prefill_hit_rates = [r['prefill_hit_rate'] for r in results]
     decode_hit_rates = [r['decode_hit_rate'] for r in results]
 
@@ -127,7 +127,7 @@ def plot_results(results, output_dir):
     # Plot 1: Overall Speedup vs Config
     ax1.plot(configs, speedups, 'bo-', linewidth=2, markersize=8, label='Total')
     ax1.plot(configs, prefill_speedups, 'go-', linewidth=2, markersize=8, label='Prefill')
-    ax1.plot(configs, decode_speedups, 'ro-', linewidth=2, markersize=8, label='Decode')
+    ax1.plot(configs, decode_speedups, 'ro-', linewidth=2, markersize=8, label='Decode (per-token)')
     ax1.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5, label='Baseline (1.0x)')
     ax1.set_xlabel('Number of Experts Prefetched', fontsize=12)
     ax1.set_ylabel('Speedup vs Baseline', fontsize=12)
@@ -147,11 +147,11 @@ def plot_results(results, output_dir):
     x = range(len(configs))
     width = 0.35
     ax2.bar([i - width/2 for i in x], prefill_speedups, width, label='Prefill', color='green', alpha=0.7)
-    ax2.bar([i + width/2 for i in x], decode_speedups, width, label='Decode', color='red', alpha=0.7)
+    ax2.bar([i + width/2 for i in x], decode_speedups, width, label='Decode (per-token)', color='red', alpha=0.7)
     ax2.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5)
     ax2.set_xlabel('Number of Experts Prefetched', fontsize=12)
     ax2.set_ylabel('Speedup vs Baseline', fontsize=12)
-    ax2.set_title('Prefill vs Decode Speedup', fontsize=14, fontweight='bold')
+    ax2.set_title('Prefill vs Decode Speedup (per-token)', fontsize=14, fontweight='bold')
     ax2.set_xticks(x)
     ax2.set_xticklabels(configs)
     ax2.grid(True, alpha=0.3, axis='y')
@@ -222,17 +222,17 @@ def main():
         result = {
             'num_experts': num_experts,
             'prefill_time': prefill_time,
-            'decode_time': decode_time,
+            'decode_time_per_token': decode_time,
             'total_time': total_time,
             'speedup': total_speedup,
             'prefill_speedup': prefill_speedup,
-            'decode_speedup': decode_speedup,
+            'decode_speedup_per_token': decode_speedup,
             'prefill_hit_rate': prefill_hit_rate,
             'decode_hit_rate': decode_hit_rate
         }
         results.append(result)
 
-        print(f"\n📈 Config {num_experts}: {total_speedup:.3f}x total speedup (Prefill: {prefill_speedup:.3f}x, Decode: {decode_speedup:.3f}x)")
+        print(f"\n📈 Config {num_experts}: {total_speedup:.3f}x total speedup (Prefill: {prefill_speedup:.3f}x, Decode/token: {decode_speedup:.3f}x)")
 
         # Pattern file now exists after first prefetch run
         pattern_file_exists = True
@@ -240,8 +240,8 @@ def main():
     # Save results to CSV
     csv_path = os.path.join(output_dir, 'benchmark_results.csv')
     with open(csv_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['num_experts', 'prefill_time', 'decode_time', 'total_time',
-                                                 'prefill_speedup', 'decode_speedup', 'speedup',
+        writer = csv.DictWriter(f, fieldnames=['num_experts', 'prefill_time', 'decode_time_per_token', 'total_time',
+                                                 'prefill_speedup', 'decode_speedup_per_token', 'speedup',
                                                  'prefill_hit_rate', 'decode_hit_rate'])
         writer.writeheader()
         writer.writerows(results)
@@ -251,10 +251,11 @@ def main():
     # Save summary JSON
     summary = {
         'baseline_prefill_time': baseline_prefill_time,
-        'baseline_decode_time': baseline_decode_time,
+        'baseline_decode_time_per_token': baseline_decode_time,
         'baseline_total_time': baseline_total_time,
         'baseline_prefill_hit_rate': baseline_prefill_hit_rate,
         'baseline_decode_hit_rate': baseline_decode_hit_rate,
+        'output_tokens': configs_to_test[0] if configs_to_test else 20,  # Store output_tokens used
         'timestamp': timestamp,
         'configs': results
     }
@@ -267,7 +268,7 @@ def main():
 
     # Generate plots
     if results:
-        plot_results(results, output_dir)
+        plot_results(results, output_dir, 20)  # Pass output_tokens
 
     # Print summary
     print("\n" + "="*80)
@@ -275,7 +276,7 @@ def main():
     print("="*80)
     print(f"Baseline timing:")
     print(f"  Prefill: {baseline_prefill_time:.3f}s")
-    print(f"  Decode:  {baseline_decode_time:.3f}s")
+    print(f"  Decode:  {baseline_decode_time:.3f}s/token")
     print(f"  Total:   {baseline_total_time:.3f}s")
     print(f"\nBest configurations by total speedup:")
 
@@ -283,7 +284,7 @@ def main():
     sorted_results = sorted(results, key=lambda x: x['speedup'], reverse=True)
     for i, result in enumerate(sorted_results[:5]):
         print(f"{i+1}. {result['num_experts']} experts: {result['speedup']:.3f}x total speedup "
-              f"(Prefill: {result['prefill_speedup']:.3f}x, Decode: {result['decode_speedup']:.3f}x)")
+              f"(Prefill: {result['prefill_speedup']:.3f}x, Decode/token: {result['decode_speedup_per_token']:.3f}x)")
         print(f"   Hit rates - Prefill: {result['prefill_hit_rate']:.1%}, Decode: {result['decode_hit_rate']:.1%}")
 
     print(f"\nBest configurations by prefill speedup:")
@@ -291,10 +292,10 @@ def main():
     for i, result in enumerate(sorted_by_prefill[:3]):
         print(f"{i+1}. {result['num_experts']} experts: {result['prefill_speedup']:.3f}x prefill speedup")
 
-    print(f"\nBest configurations by decode speedup:")
-    sorted_by_decode = sorted(results, key=lambda x: x['decode_speedup'], reverse=True)
+    print(f"\nBest configurations by decode speedup (per-token):")
+    sorted_by_decode = sorted(results, key=lambda x: x['decode_speedup_per_token'], reverse=True)
     for i, result in enumerate(sorted_by_decode[:3]):
-        print(f"{i+1}. {result['num_experts']} experts: {result['decode_speedup']:.3f}x decode speedup")
+        print(f"{i+1}. {result['num_experts']} experts: {result['decode_speedup_per_token']:.3f}x decode speedup per token")
 
     print("="*80)
 

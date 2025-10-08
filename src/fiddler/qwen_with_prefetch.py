@@ -635,12 +635,15 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         prefill_time = self.prefill_time
         decode_time = self.decode_time
 
+        # Calculate decode time per token
+        decode_time_per_token = decode_time / output_token if output_token > 0 else 0.0
+
         print(f"Generated: {generated_text}")
         print(f"🎯 Prefetch hit rate - Overall: {overall_hit_rate:.1%}, Prefill: {prefill_hit_rate:.1%}, Decode: {decode_hit_rate:.1%}")
-        print(f"⏱️  Prefill: {prefill_time:.3f}s, Decode: {decode_time:.3f}s")
+        print(f"⏱️  Prefill: {prefill_time:.3f}s, Decode: {decode_time_per_token:.3f}s/token")
 
-        # Return separate hit rates for prefill and decode
-        return (prefill_time, decode_time, prefill_hit_rate, decode_hit_rate)
+        # Return separate hit rates for prefill and decode (with per-token decode time)
+        return (prefill_time, decode_time_per_token, prefill_hit_rate, decode_hit_rate)
 
     def get_prefetch_stats(self):
         """Get detailed prefetch statistics."""

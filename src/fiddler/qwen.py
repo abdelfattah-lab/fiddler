@@ -469,12 +469,15 @@ class FiddlerQwen:
         prefill_time = self.prefill_time
         decode_time = self.decode_time
 
-        print(f"Generated: {generated_text}")
-        print(f"⏱️  Prefill: {prefill_time:.3f}s, Decode: {decode_time:.3f}s")
+        # Calculate decode time per token
+        decode_time_per_token = decode_time / output_token if output_token > 0 else 0.0
 
-        # Return format: (prefill_time, decode_time, prefill_hit_rate, decode_hit_rate)
+        print(f"Generated: {generated_text}")
+        print(f"⏱️  Prefill: {prefill_time:.3f}s, Decode: {decode_time_per_token:.3f}s/token")
+
+        # Return format: (prefill_time, decode_time_per_token, prefill_hit_rate, decode_hit_rate)
         # Baseline doesn't track phase-specific hit rates, so return same rate for both
-        return (prefill_time, decode_time, hit_rate, hit_rate)
+        return (prefill_time, decode_time_per_token, hit_rate, hit_rate)
 
     def tokenize(self, text):
         """Tokenize text - for interface compatibility."""
