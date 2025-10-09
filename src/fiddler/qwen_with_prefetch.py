@@ -117,14 +117,35 @@ class PrefetchMetrics:
 
 
 class FiddlerQwenWithPrefetch(FiddlerQwen):
-    """Qwen implementation with prefetch capabilities."""
+    """Qwen implementation with prefetch capabilities and optional Fiddler CPU offloading."""
 
-    def __init__(self, args, num_experts_to_prefetch=1):
+    def __init__(self, args, num_experts_to_prefetch=1, enable_cpu_offload=False,
+                 latency_cpu=None, latency_gpu=None, n_gpu_resident_experts=0):
         # Initialize base class (includes Fiddler mode support)
         super().__init__(args)
 
         # Configure number of experts to prefetch per layer (0-16)
         self.num_experts_to_prefetch = max(0, min(16, num_experts_to_prefetch))
+
+        # Fiddler CPU offloading parameters
+        self.enable_cpu_offload = enable_cpu_offload
+
+        # Cost model parameters (will be set from profiling or defaults)
+        self.latency_cpu = latency_cpu  # ms per token on CPU
+        self.latency_gpu = latency_gpu  # ms constant on GPU (transfer overhead)
+
+        # Number of experts to keep permanently on GPU (popular experts)
+        self.n_gpu_resident_experts = n_gpu_resident_experts
+
+        # Track expert location: expert_loc[layer_idx][expert_idx] = 0 (CPU) or 1 (GPU)
+        # This is dynamically determined per forward pass for non-resident experts
+        self.expert_loc = {}  # Will be populated during forward pass
+
+        # Track CPU execution statistics
+        self.cpu_expert_count = 0
+        self.gpu_expert_count = 0
+        self.cpu_execution_time = 0.0
+        self.gpu_execution_time = 0.0
 
         # Fiddler mode is inherited from base class
         # self.use_fiddler_mode and self.fiddler_batch_threshold are already set
@@ -287,78 +308,174 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         # Find active experts (same as baseline)
         expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
 
-        # Process each active expert (adapted from baseline)
-        for i, expert_idx_tensor in enumerate(expert_hit):
-            expert_idx = expert_idx_tensor.item()
+        # CPU OFFLOADING: Partition experts if enabled
+        if self.enable_cpu_offload and layer_idx not in self.gpu_resident_layers:
+            # Step 1: Calculate token counts for each active expert
+            expert_token_counts = {}
+            expert_data = {}  # Store expert data for later processing
 
-            # Find tokens assigned to this expert (same as baseline)
-            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
+            for i, expert_idx_tensor in enumerate(expert_hit):
+                expert_idx = expert_idx_tensor.item()
+                idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
 
-            if len(top_x) == 0:
-                continue
+                if len(top_x) == 0:
+                    continue
 
-            # Get input for this expert (same as baseline)
-            current_state = hidden_states_flat[None, top_x].reshape(-1, hidden_dim)
+                expert_token_counts[expert_idx] = len(top_x)
+                expert_data[expert_idx] = {
+                    'idx': idx,
+                    'top_x': top_x,
+                    'input': hidden_states_flat[None, top_x].reshape(-1, hidden_dim),
+                    'weights': routing_weights[top_x, idx, None]
+                }
 
-            # Get routing weights for this expert (same as baseline)
-            expert_routing_weights = routing_weights[top_x, idx, None]
+            # Step 2: Calculate costs and partition experts
+            cost_per_expert = self._calculate_expert_costs(expert_token_counts, layer_idx)
+            cpu_expert_list, gpu_expert_list = self._partition_experts_greedy(cost_per_expert)
 
-            # Check if this is a GPU-resident layer (0-1)
-            if layer_idx in self.gpu_resident_layers:
-                # Use expert directly from GPU (no loading needed)
-                if NVTX_AVAILABLE:
-                    range_id = nvtx.start_range(f"GPU_RESIDENT: Layer{layer_idx}_Expert{expert_idx}")
-                expert_buffer = moe_layer.experts[expert_idx]
-                if NVTX_AVAILABLE:
-                    nvtx.end_range(range_id)
-                self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=True)
-                self.cnt_expert_hit += len(top_x)
-            # Check if expert was prefetched, use prefetched version if available
-            elif self._is_expert_prefetched(layer_idx, expert_idx):
-                # CRITICAL: Wait for async transfer to complete before using the expert
-                # This ensures correctness while still allowing parallelism (transfer happens
-                # in parallel with previous layer's compute, we only sync when actually needed)
-                cache_key = (layer_idx, expert_idx)
-                if cache_key in self.expert_ready_events:
-                    # Synchronize with the prefetch stream to ensure transfer is complete
-                    self.expert_ready_events[cache_key].synchronize()
+            if NVTX_AVAILABLE and len(cpu_expert_list) > 0:
+                nvtx_cpu_range = nvtx.start_range(f"CPU_EXPERTS: Layer{layer_idx} ({len(cpu_expert_list)} experts)")
 
-                # Use prefetched expert
-                if NVTX_AVAILABLE:
-                    range_id = nvtx.start_range(f"PREFETCH_HIT: Layer{layer_idx}_Expert{expert_idx}")
-                expert_buffer = self._get_expert_for_execution_with_prefetch(layer_idx, expert_idx, was_prefetched=True)
-                if NVTX_AVAILABLE:
-                    nvtx.end_range(range_id)
-                self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=True)
-                self.cnt_expert_hit += len(top_x)
-            else:
-                # Load expert on-demand using the base class method
-                if NVTX_AVAILABLE:
-                    range_id = nvtx.start_range(f"EXPERT_LOAD_ON_DEMAND: Layer{layer_idx}_Expert{expert_idx}")
-                expert_buffer = self._get_expert_for_execution(layer_idx, expert_idx)
-                if NVTX_AVAILABLE:
-                    nvtx.end_range(range_id)
-                self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=False)
+            # Step 3: Process CPU experts
+            for expert_idx in cpu_expert_list:
+                data = expert_data[expert_idx]
+                top_x = data['top_x']
 
-            self.cnt_expert_all += len(top_x)
+                # Execute on CPU
+                cpu_start = time.time()
+                weighted_output = self._run_expert_on_cpu(
+                    layer_idx, expert_idx, data['input'], data['weights']
+                )
+                cpu_elapsed = time.time() - cpu_start
 
-            # Execute expert computation on GPU (same as baseline)
-            if current_state.device != expert_buffer.gate_proj.weight.device:
-                current_state = current_state.to(expert_buffer.gate_proj.weight.device)
+                self.cpu_expert_count += 1
+                self.cpu_execution_time += cpu_elapsed
+                self.cnt_expert_all += len(top_x)
 
-            expert_output = expert_buffer(current_state)
+                # Accumulate results
+                weighted_output = weighted_output.to(final_hidden_states.dtype)
+                final_hidden_states.index_add_(0, top_x, weighted_output)
 
-            # Apply routing weights (same as baseline)
-            current_hidden_states = expert_output * expert_routing_weights.to(expert_output.device)
+            if NVTX_AVAILABLE and len(cpu_expert_list) > 0:
+                nvtx.end_range(nvtx_cpu_range)
 
-            # Move back to original device if needed and accumulate (same as baseline)
-            if current_hidden_states.device != final_hidden_states.device:
-                current_hidden_states = current_hidden_states.to(final_hidden_states.device)
+            if NVTX_AVAILABLE and len(gpu_expert_list) > 0:
+                nvtx_gpu_range = nvtx.start_range(f"GPU_EXPERTS: Layer{layer_idx} ({len(gpu_expert_list)} experts)")
 
-            # Ensure dtype consistency before accumulation (same as baseline)
-            current_hidden_states = current_hidden_states.to(final_hidden_states.dtype)
+            # Step 4: Process GPU experts (with prefetch support)
+            for expert_idx in gpu_expert_list:
+                data = expert_data[expert_idx]
+                top_x = data['top_x']
+                current_state = data['input']
+                expert_routing_weights = data['weights']
 
-            final_hidden_states.index_add_(0, top_x, current_hidden_states)
+                # Check if expert was prefetched
+                if self._is_expert_prefetched(layer_idx, expert_idx):
+                    cache_key = (layer_idx, expert_idx)
+                    if cache_key in self.expert_ready_events:
+                        self.expert_ready_events[cache_key].synchronize()
+
+                    expert_buffer = self._get_expert_for_execution_with_prefetch(
+                        layer_idx, expert_idx, was_prefetched=True
+                    )
+                    self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=True)
+                    self.cnt_expert_hit += len(top_x)
+                else:
+                    expert_buffer = self._get_expert_for_execution(layer_idx, expert_idx)
+                    self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=False)
+
+                self.gpu_expert_count += 1
+                self.cnt_expert_all += len(top_x)
+
+                # Execute on GPU
+                if current_state.device != expert_buffer.gate_proj.weight.device:
+                    current_state = current_state.to(expert_buffer.gate_proj.weight.device)
+
+                expert_output = expert_buffer(current_state)
+                current_hidden_states = expert_output * expert_routing_weights.to(expert_output.device)
+
+                # Accumulate results
+                if current_hidden_states.device != final_hidden_states.device:
+                    current_hidden_states = current_hidden_states.to(final_hidden_states.device)
+                current_hidden_states = current_hidden_states.to(final_hidden_states.dtype)
+                final_hidden_states.index_add_(0, top_x, current_hidden_states)
+
+            if NVTX_AVAILABLE and len(gpu_expert_list) > 0:
+                nvtx.end_range(nvtx_gpu_range)
+
+        else:
+            # STANDARD PATH: No CPU offloading, use existing prefetch logic
+            for i, expert_idx_tensor in enumerate(expert_hit):
+                expert_idx = expert_idx_tensor.item()
+
+                # Find tokens assigned to this expert (same as baseline)
+                idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
+
+                if len(top_x) == 0:
+                    continue
+
+                # Get input for this expert (same as baseline)
+                current_state = hidden_states_flat[None, top_x].reshape(-1, hidden_dim)
+
+                # Get routing weights for this expert (same as baseline)
+                expert_routing_weights = routing_weights[top_x, idx, None]
+
+                # Check if this is a GPU-resident layer (0-1)
+                if layer_idx in self.gpu_resident_layers:
+                    # Use expert directly from GPU (no loading needed)
+                    if NVTX_AVAILABLE:
+                        range_id = nvtx.start_range(f"GPU_RESIDENT: Layer{layer_idx}_Expert{expert_idx}")
+                    expert_buffer = moe_layer.experts[expert_idx]
+                    if NVTX_AVAILABLE:
+                        nvtx.end_range(range_id)
+                    self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=True)
+                    self.cnt_expert_hit += len(top_x)
+                # Check if expert was prefetched, use prefetched version if available
+                elif self._is_expert_prefetched(layer_idx, expert_idx):
+                    # CRITICAL: Wait for async transfer to complete before using the expert
+                    # This ensures correctness while still allowing parallelism (transfer happens
+                    # in parallel with previous layer's compute, we only sync when actually needed)
+                    cache_key = (layer_idx, expert_idx)
+                    if cache_key in self.expert_ready_events:
+                        # Synchronize with the prefetch stream to ensure transfer is complete
+                        self.expert_ready_events[cache_key].synchronize()
+
+                    # Use prefetched expert
+                    if NVTX_AVAILABLE:
+                        range_id = nvtx.start_range(f"PREFETCH_HIT: Layer{layer_idx}_Expert{expert_idx}")
+                    expert_buffer = self._get_expert_for_execution_with_prefetch(layer_idx, expert_idx, was_prefetched=True)
+                    if NVTX_AVAILABLE:
+                        nvtx.end_range(range_id)
+                    self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=True)
+                    self.cnt_expert_hit += len(top_x)
+                else:
+                    # Load expert on-demand using the base class method
+                    if NVTX_AVAILABLE:
+                        range_id = nvtx.start_range(f"EXPERT_LOAD_ON_DEMAND: Layer{layer_idx}_Expert{expert_idx}")
+                    expert_buffer = self._get_expert_for_execution(layer_idx, expert_idx)
+                    if NVTX_AVAILABLE:
+                        nvtx.end_range(range_id)
+                    self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=False)
+
+                self.cnt_expert_all += len(top_x)
+
+                # Execute expert computation on GPU (same as baseline)
+                if current_state.device != expert_buffer.gate_proj.weight.device:
+                    current_state = current_state.to(expert_buffer.gate_proj.weight.device)
+
+                expert_output = expert_buffer(current_state)
+
+                # Apply routing weights (same as baseline)
+                current_hidden_states = expert_output * expert_routing_weights.to(expert_output.device)
+
+                # Move back to original device if needed and accumulate (same as baseline)
+                if current_hidden_states.device != final_hidden_states.device:
+                    current_hidden_states = current_hidden_states.to(final_hidden_states.device)
+
+                # Ensure dtype consistency before accumulation (same as baseline)
+                current_hidden_states = current_hidden_states.to(final_hidden_states.dtype)
+
+                final_hidden_states.index_add_(0, top_x, current_hidden_states)
 
         # Add shared expert (same as baseline)
         shared_expert_output = moe_layer.shared_expert(hidden_states_flat)
@@ -564,6 +681,131 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
                 if NVTX_AVAILABLE:
                     nvtx.end_range(range_id)
 
+    def _calculate_expert_costs(self, expert_token_counts, layer_idx):
+        """
+        Calculate CPU and GPU costs for each expert based on token counts.
+
+        Args:
+            expert_token_counts: dict mapping expert_idx -> num_tokens assigned to that expert
+            layer_idx: current layer index
+
+        Returns:
+            cost_per_expert: dict mapping expert_idx -> (cpu_cost, gpu_cost) in ms
+        """
+        # Default cost model parameters if not specified
+        latency_cpu = self.latency_cpu if self.latency_cpu is not None else 0.05  # ms per token on CPU
+        latency_gpu = self.latency_gpu if self.latency_gpu is not None else 5.0   # ms expert transfer cost
+
+        cost_per_expert = {}
+
+        for expert_idx, num_tokens in expert_token_counts.items():
+            # CPU cost: Fiddler's model (execution only, outputs accumulate directly)
+            cpu_cost = num_tokens * latency_cpu
+
+            # GPU cost depends on whether expert needs to be transferred
+            if layer_idx in self.gpu_resident_layers or self._is_expert_prefetched(layer_idx, expert_idx):
+                # Expert is on GPU (resident or prefetched)
+                # GPU execution is faster than CPU (no transfer needed)
+                # Use lower cost to prefer GPU for prefetched experts
+                gpu_cost = 0.7 * num_tokens * latency_cpu  # GPU 30% faster than CPU for execution
+            else:
+                # Expert needs to be transferred from CPU to GPU
+                gpu_cost = latency_gpu  # Transfer dominates for on-demand loading
+
+            cost_per_expert[expert_idx] = (cpu_cost, gpu_cost)
+
+        return cost_per_expert
+
+    def _partition_experts_greedy(self, cost_per_expert):
+        """
+        Greedy algorithm to partition experts between CPU and GPU.
+
+        The goal is to minimize max(cpu_cost, gpu_cost) - the critical path latency.
+
+        Args:
+            cost_per_expert: dict mapping expert_idx -> (cpu_cost, gpu_cost)
+
+        Returns:
+            cpu_experts: list of expert indices to run on CPU
+            gpu_experts: list of expert indices to run on GPU
+        """
+        if not cost_per_expert:
+            return [], []
+
+        # Calculate benefit of moving expert from GPU to CPU
+        # Positive benefit means moving to CPU is beneficial
+        benefits = []
+        for expert_idx, (cpu_cost, gpu_cost) in cost_per_expert.items():
+            # Benefit = GPU cost saved - CPU cost added
+            benefit = gpu_cost - cpu_cost
+            benefits.append((benefit, expert_idx, cpu_cost, gpu_cost))
+
+        # Sort by benefit (descending - highest benefit first)
+        benefits.sort(reverse=True)
+
+        # Initialize: all experts on GPU
+        cpu_experts = []
+        gpu_experts = list(cost_per_expert.keys())
+
+        # Calculate initial costs
+        cpu_cost_total = 0.0
+        gpu_cost_total = sum(cost_per_expert[idx][1] for idx in gpu_experts)
+
+        current_bottleneck = max(cpu_cost_total, gpu_cost_total)
+
+        # Greedily move experts to CPU if it reduces the bottleneck
+        for benefit, expert_idx, cpu_cost, gpu_cost in benefits:
+            if benefit <= 0:
+                # No benefit to moving to CPU, stop
+                break
+
+            # Try moving this expert to CPU
+            new_cpu_cost = cpu_cost_total + cpu_cost
+            new_gpu_cost = gpu_cost_total - gpu_cost
+
+            new_bottleneck = max(new_cpu_cost, new_gpu_cost)
+
+            # Only move if it reduces the bottleneck
+            if new_bottleneck < current_bottleneck:
+                cpu_experts.append(expert_idx)
+                gpu_experts.remove(expert_idx)
+                cpu_cost_total = new_cpu_cost
+                gpu_cost_total = new_gpu_cost
+                current_bottleneck = new_bottleneck
+
+        return cpu_experts, gpu_experts
+
+    def _run_expert_on_cpu(self, layer_idx, expert_idx, input_tensor, routing_weights):
+        """
+        Execute expert on CPU and return results.
+
+        Args:
+            layer_idx: layer index
+            expert_idx: expert index
+            input_tensor: input tensor (on GPU)
+            routing_weights: routing weights for this expert (on GPU)
+
+        Returns:
+            expert_output: output tensor (on GPU, ready for accumulation)
+        """
+        moe_layer = self.model.model.layers[layer_idx].mlp
+        cpu_expert = moe_layer.experts[expert_idx]
+
+        # Move input to CPU
+        input_cpu = input_tensor.cpu()
+
+        # Execute expert on CPU
+        with torch.no_grad():
+            expert_output_cpu = cpu_expert(input_cpu)
+
+        # Move output back to GPU
+        expert_output_gpu = expert_output_cpu.to(self.device, dtype=self.dtype)
+
+        # Apply routing weights (on GPU)
+        weighted_output = expert_output_gpu * routing_weights.to(expert_output_gpu.device)
+
+        return weighted_output
+
     def generate(self, text=None, output_token=20, input_token=None):
         """Generate with prefetch-aware processing and metrics tracking."""
         # Handle text input
@@ -590,9 +832,20 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         # Reset prefetch metrics
         self.metrics = PrefetchMetrics()
 
+        # Reset CPU offloading statistics
+        self.cpu_expert_count = 0
+        self.gpu_expert_count = 0
+        self.cpu_execution_time = 0.0
+        self.gpu_execution_time = 0.0
+
         # Reset profiler token position for new generation
         if not self.collection_mode:
             self.profiler.current_token_pos = 0
+
+        # CRITICAL: Clear prefetch caches to avoid stale experts from previous generation
+        self.prefetch_cache_A.clear()
+        self.prefetch_cache_B.clear()
+        self.expert_ready_events.clear()
 
         # Reset timing statistics
         self.prefill_time = 0.0
@@ -647,6 +900,14 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         print(f"🎯 Prefetch hit rate - Overall: {overall_hit_rate:.1%}, Prefill: {prefill_hit_rate:.1%}, Decode: {decode_hit_rate:.1%}")
         print(f"⏱️  Prefill: {prefill_time:.3f}s, Decode: {decode_time:.3f}s")
 
+        # Print CPU offloading statistics if enabled
+        if self.enable_cpu_offload:
+            total_experts = self.cpu_expert_count + self.gpu_expert_count
+            cpu_pct = (self.cpu_expert_count / total_experts * 100) if total_experts > 0 else 0
+            gpu_pct = (self.gpu_expert_count / total_experts * 100) if total_experts > 0 else 0
+            print(f"🖥️  CPU offloading: {self.cpu_expert_count} CPU ({cpu_pct:.1f}%), {self.gpu_expert_count} GPU ({gpu_pct:.1f}%)")
+            print(f"⚡ CPU exec time: {self.cpu_execution_time:.3f}s, GPU exec time: {self.gpu_execution_time:.3f}s")
+
         # Return separate hit rates for prefill and decode
         return (prefill_time, decode_time, prefill_hit_rate, decode_hit_rate)
 
@@ -663,4 +924,18 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
             'prefill_misses': self.metrics.prefill_misses,
             'decode_hits': self.metrics.decode_hits,
             'decode_misses': self.metrics.decode_misses
+        }
+
+    def get_cpu_offload_stats(self):
+        """Get detailed CPU offloading statistics."""
+        total_experts = self.cpu_expert_count + self.gpu_expert_count
+        return {
+            'cpu_expert_count': self.cpu_expert_count,
+            'gpu_expert_count': self.gpu_expert_count,
+            'total_expert_count': total_experts,
+            'cpu_percentage': (self.cpu_expert_count / total_experts * 100) if total_experts > 0 else 0,
+            'gpu_percentage': (self.gpu_expert_count / total_experts * 100) if total_experts > 0 else 0,
+            'cpu_execution_time': self.cpu_execution_time,
+            'gpu_execution_time': self.gpu_execution_time,
+            'enabled': self.enable_cpu_offload
         }
