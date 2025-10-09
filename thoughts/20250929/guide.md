@@ -6,9 +6,12 @@ Always update guide.md to prepare it for another agent to look at it and underst
 
 ## Current Goal
 
-✅ **COMPLETED** (October 7, 2025): Fixed the correctness bug with 4+ experts by adding proper async synchronization. All configurations 0-16 now work correctly with excellent speedup (up to 1.428x decode speedup) and high hit rates (100% decode hit rate for configs 4+).
+Try to run benchmark_prefetch_configs.py and fix the issues that come out when it runs
 
 ## Completed Tasks
+
+✅ **COMPLETED** (October 7, 2025): Fixed the correctness bug with 4+ experts by adding proper async synchronization. All configurations 0-16 now work correctly with excellent speedup (up to 1.428x decode speedup) and high hit rates (100% decode hit rate for configs 4+).
+
 
 ✅ COMPLETED: **Fixed correctness bug with 4+ experts** (October 7, 2025)
 - **Root cause**: Missing synchronization for async CUDA transfers

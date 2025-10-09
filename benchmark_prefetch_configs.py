@@ -74,7 +74,7 @@ def run_prefetch_config(num_experts, pattern_file_exists):
         # Make sure pattern file exists for prediction mode
         if not pattern_file_exists:
             print("⚠️  Skipping config with 0 experts - need pattern file first")
-            return None, None, None, None
+            return None, None, None, None, None
 
     model = FiddlerQwenWithPrefetch(args, num_experts_to_prefetch=num_experts)
 
@@ -194,8 +194,11 @@ def main():
     output_dir = f"prefetch_benchmark_{timestamp}"
     os.makedirs(output_dir, exist_ok=True)
 
-    # Check if pattern file exists
+    # Delete the patterns file before first run to ensure clean collection
     pattern_file = "expert_usage_patterns_qwen.json"
+    if os.path.exists(pattern_file):
+        os.remove(pattern_file)
+        print(f"🗑️  Deleted existing pattern file: {pattern_file}")
     pattern_file_exists = os.path.exists(pattern_file)
 
     # Run baseline
@@ -203,7 +206,7 @@ def main():
 
     # Test different configurations
     results = []
-    configs_to_test = list(range(0, 17))  # 0 to 16 experts
+    configs_to_test = list(range(0, 5))  # 0 to 16 experts
 
     for num_experts in configs_to_test:
         prefill_time, decode_time, total_time, prefill_hit_rate, decode_hit_rate = run_prefetch_config(num_experts, pattern_file_exists)
