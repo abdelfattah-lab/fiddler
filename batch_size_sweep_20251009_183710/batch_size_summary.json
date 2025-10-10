@@ -1,0 +1,283 @@
+{
+  "timestamp": "20251009_183710",
+  "batch_sizes": [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32
+  ],
+  "configurations": [
+    "Baseline",
+    "Prefetch",
+    "Fiddler",
+    "Fiddler+Prefetch"
+  ],
+  "results": [
+    {
+      "config": "Baseline",
+      "batch_size": 1,
+      "prefill_time": 0.40424680709838867,
+      "decode_time": 2.077936887741089,
+      "total_time": 2.6290876865386963,
+      "prefill_hit_rate": 1.0,
+      "decode_hit_rate": 1.0,
+      "tokens_per_second": 9.624931400944455,
+      "throughput": 0.3803600789430275
+    },
+    {
+      "config": "Baseline",
+      "batch_size": 2,
+      "prefill_time": 0.4362313747406006,
+      "decode_time": 15.0155508518219,
+      "total_time": 15.45460319519043,
+      "prefill_hit_rate": 0.0,
+      "decode_hit_rate": 0.0,
+      "tokens_per_second": 2.6639049339403114,
+      "throughput": 0.1294112812047101
+    },
+    {
+      "config": "Baseline",
+      "batch_size": 4,
+      "prefill_time": 0.42220067977905273,
+      "decode_time": 15.02267050743103,
+      "total_time": 15.446993589401245,
+      "prefill_hit_rate": 0.0,
+      "decode_hit_rate": 0.0,
+      "tokens_per_second": 5.325284872648152,
+      "throughput": 0.25895006538648063
+    },
+    {
+      "config": "Baseline",
+      "batch_size": 8,
+      "prefill_time": 0.4173145294189453,
+      "decode_time": 15.03096079826355,
+      "total_time": 15.45089340209961,
+      "prefill_hit_rate": 0.0,
+      "decode_hit_rate": 0.0,
+      "tokens_per_second": 10.644695448775568,
+      "throughput": 0.5177694125384935
+    },
+    {
+      "config": "Baseline",
+      "batch_size": 16,
+      "prefill_time": 0.425555944442749,
+      "decode_time": 15.045228719711304,
+      "total_time": 15.473177194595337,
+      "prefill_hit_rate": 0.0,
+      "decode_hit_rate": 0.0,
+      "tokens_per_second": 21.269201416709357,
+      "throughput": 1.0340474873892531
+    },
+    {
+      "config": "Baseline",
+      "batch_size": 32,
+      "prefill_time": 0.4227912425994873,
+      "decode_time": 15.075501680374146,
+      "total_time": 15.501826047897339,
+      "prefill_hit_rate": 0.0,
+      "decode_hit_rate": 0.0,
+      "tokens_per_second": 42.45298190196722,
+      "throughput": 2.064272937983359
+    },
+    {
+      "config": "Prefetch",
+      "batch_size": 1,
+      "prefill_time": 0.3618946075439453,
+      "decode_time": 1.453711748123169,
+      "total_time": 1.981443166732788,
+      "prefill_hit_rate": 0.5528455284552846,
+      "decode_hit_rate": 1.0,
+      "tokens_per_second": 13.757885650866637,
+      "throughput": 0.5046826559496557
+    },
+    {
+      "config": "Prefetch",
+      "batch_size": 2,
+      "prefill_time": 0.3708484172821045,
+      "decode_time": 13.600797176361084,
+      "total_time": 13.97341251373291,
+      "prefill_hit_rate": 0.0,
+      "decode_hit_rate": 0.0,
+      "tokens_per_second": 2.9410040809609415,
+      "throughput": 0.14312895994692942
+    },
+    {
+      "config": "Prefetch",
+      "batch_size": 4,
+      "prefill_time": 0.37586069107055664,
+      "decode_time": 13.654486417770386,
+      "total_time": 14.032562494277954,
+      "prefill_hit_rate": 0.0,
+      "decode_hit_rate": 0.0,
+      "tokens_per_second": 5.858880191633237,
+      "throughput": 0.2850512870782565
+    },
+    {
+      "config": "Prefetch",
+      "batch_size": 8,
+      "prefill_time": 0.3831675052642822,
+      "decode_time": 13.686617374420166,
+      "total_time": 14.07190227508545,
+      "prefill_hit_rate": 0.0,
+      "decode_hit_rate": 0.0,
+      "tokens_per_second": 11.690251551784788,
+      "throughput": 0.5685087803774861
+    },
+    {
+      "config": "Prefetch",
+      "batch_size": 16,
+      "prefill_time": 0.38231468200683594,
+      "decode_time": 13.73430323600769,
+      "total_time": 14.11909031867981,
+      "prefill_hit_rate": 0.0,
+      "decode_hit_rate": 0.0,
+      "tokens_per_second": 23.29932538266995,
+      "throughput": 1.1332174834827504
+    },
+    {
+      "config": "Prefetch",
+      "batch_size": 32,
+      "prefill_time": 0.388446569442749,
+      "decode_time": 13.677616357803345,
+      "total_time": 14.068545818328857,
+      "prefill_hit_rate": 0.0,
+      "decode_hit_rate": 0.0,
+      "tokens_per_second": 46.79177886392958,
+      "throughput": 2.2745776580767565
+    },
+    {
+      "config": "Fiddler",
+      "batch_size": 1,
+      "prefill_time": 0.168928861618042,
+      "decode_time": 0.9412620067596436,
+      "total_time": 1.3213272094726562,
+      "prefill_hit_rate": 1.0,
+      "decode_hit_rate": 1.0,
+      "tokens_per_second": 21.248068929129857,
+      "throughput": 0.7568148092546293
+    },
+    {
+      "config": "Fiddler",
+      "batch_size": 2,
+      "prefill_time": 0.23227930068969727,
+      "decode_time": 7.50717830657959,
+      "total_time": 7.741974830627441,
+      "prefill_hit_rate": 0.0,
+      "decode_hit_rate": 0.0,
+      "tokens_per_second": 5.328233640719897,
+      "throughput": 0.25833202041525
+    },
+    {
+      "config": "Fiddler",
+      "batch_size": 4,
+      "prefill_time": 0.22278666496276855,
+      "decode_time": 10.03487253189087,
+      "total_time": 10.260431051254272,
+      "prefill_hit_rate": 0.0,
+      "decode_hit_rate": 0.0,
+      "tokens_per_second": 7.972198923878669,
+      "throughput": 0.3898471691899363
+    },
+    {
+      "config": "Fiddler",
+      "batch_size": 8,
+      "prefill_time": 0.28858160972595215,
+      "decode_time": 13.652066230773926,
+      "total_time": 13.9435715675354,
+      "prefill_hit_rate": 0.0,
+      "decode_hit_rate": 0.0,
+      "tokens_per_second": 11.719837663791477,
+      "throughput": 0.5737410936109278
+    },
+    {
+      "config": "Fiddler",
+      "batch_size": 16,
+      "prefill_time": 0.5061039924621582,
+      "decode_time": 19.087289094924927,
+      "total_time": 19.59717035293579,
+      "prefill_hit_rate": 0.0,
+      "decode_hit_rate": 0.0,
+      "tokens_per_second": 16.765083737589748,
+      "throughput": 0.8164444004847409
+    },
+    {
+      "config": "Fiddler",
+      "batch_size": 32,
+      "prefill_time": 0.6721880435943604,
+      "decode_time": 27.9017596244812,
+      "total_time": 28.57762098312378,
+      "prefill_hit_rate": 0.0,
+      "decode_hit_rate": 0.0,
+      "tokens_per_second": 22.937621448020057,
+      "throughput": 1.1197573100608085
+    },
+    {
+      "config": "Fiddler+Prefetch",
+      "batch_size": 1,
+      "prefill_time": 0.18725037574768066,
+      "decode_time": 1.457059621810913,
+      "total_time": 1.8178138732910156,
+      "prefill_hit_rate": 1.0,
+      "decode_hit_rate": 1.0,
+      "tokens_per_second": 13.72627427225175,
+      "throughput": 0.5501113258584472
+    },
+    {
+      "config": "Fiddler+Prefetch",
+      "batch_size": 2,
+      "prefill_time": 0.22797179222106934,
+      "decode_time": 6.983515024185181,
+      "total_time": 7.2138872146606445,
+      "prefill_hit_rate": 0.0,
+      "decode_hit_rate": 0.0,
+      "tokens_per_second": 5.72777460368779,
+      "throughput": 0.27724303700443753
+    },
+    {
+      "config": "Fiddler+Prefetch",
+      "batch_size": 4,
+      "prefill_time": 0.22860360145568848,
+      "decode_time": 8.96436333656311,
+      "total_time": 9.195780277252197,
+      "prefill_hit_rate": 0.0,
+      "decode_hit_rate": 0.0,
+      "tokens_per_second": 8.924225513450862,
+      "throughput": 0.43498211999419856
+    },
+    {
+      "config": "Fiddler+Prefetch",
+      "batch_size": 8,
+      "prefill_time": 0.20142412185668945,
+      "decode_time": 11.944213390350342,
+      "total_time": 12.148350954055786,
+      "prefill_hit_rate": 0.0,
+      "decode_hit_rate": 0.0,
+      "tokens_per_second": 13.39560796270293,
+      "throughput": 0.6585255916836319
+    },
+    {
+      "config": "Fiddler+Prefetch",
+      "batch_size": 16,
+      "prefill_time": 0.2660233974456787,
+      "decode_time": 17.248252868652344,
+      "total_time": 17.51732063293457,
+      "prefill_hit_rate": 0.0,
+      "decode_hit_rate": 0.0,
+      "tokens_per_second": 18.55260370060904,
+      "throughput": 0.9133816943396107
+    },
+    {
+      "config": "Fiddler+Prefetch",
+      "batch_size": 32,
+      "prefill_time": 0.5586330890655518,
+      "decode_time": 26.49070644378662,
+      "total_time": 27.052861213684082,
+      "prefill_hit_rate": 0.0,
+      "decode_hit_rate": 0.0,
+      "tokens_per_second": 24.15941610912047,
+      "throughput": 1.1828693367122853
+    }
+  ]
+}

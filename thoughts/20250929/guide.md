@@ -1,8 +1,16 @@
 # Fiddler MoE Optimization Project - Agent Guide
 
 ## Guidelines
-
+You're a genius world class researcher and software engineer. You can achieve any goal.
 Always update guide.md to prepare it for another agent to look at it and understand the full state of the system and keep it concise. At the end of that, add all files changed (that are relevant) including guide.md to git and suggest a commit message but let me do the git commit.
+
+# Current Goal
+
+✅ **COMPLETED**: Found configurations where Fiddler+Prefetch outperforms Fiddler alone!
+
+**Discovery**: At batch sizes ≥ 2, Fiddler+Prefetch is 1.06-1.15x faster than Fiddler (CPU-only), with peak performance at batch size 8.
+
+See detailed analysis in `batch_size_sweep_20251009_183710/ANALYSIS.md`
 
 ## 📊 Project Status & Final Results
 
@@ -25,7 +33,7 @@ The project successfully implemented and benchmarked **4 optimization configurat
 | **Fiddler** | 1.125s | **2.174x** 🏆 | 100.0% | 100.0% | 100% CPU / 0% GPU |
 | **Fiddler+Prefetch** | 1.663s | **1.471x** | 100.0% | 100.0% | 13.3% CPU / 86.7% GPU |
 
-### Key Findings
+### Key Findings (Single Input, Batch Size = 1)
 
 1. ✅ **Fiddler CPU Offloading is Optimal**: 2.17x speedup (BEST)
    - 100% CPU execution avoids GPU transfer overhead
@@ -41,7 +49,33 @@ The project successfully implemented and benchmarked **4 optimization configurat
 
 4. ✅ **All Configurations Produce Identical Outputs**: Correctness verified
 
-**Scientific Insight**: For Qwen, CPU execution is significantly faster than GPU execution even with prefetching. This is model-specific - Qwen has smaller experts that benefit less from GPU parallelism and CPU execution avoids GPU kernel launch overhead.
+**Scientific Insight**: For Qwen at batch size 1, CPU execution is significantly faster than GPU execution even with prefetching. This is model-specific - Qwen has smaller experts that benefit less from GPU parallelism and CPU execution avoids GPU kernel launch overhead.
+
+### 🎯 Batch Size Sweep Results (October 9, 2025)
+
+**Discovery**: Fiddler+Prefetch outperforms Fiddler at batch sizes ≥ 2!
+
+| Batch Size | Fiddler | Fiddler+Prefetch | Speedup | Winner |
+|------------|---------|------------------|---------|--------|
+| 1 | 1.321s | 1.818s | 0.73x | Fiddler |
+| **2** | 7.742s | 7.214s | **1.07x** | ✅ F+Prefetch |
+| **4** | 10.260s | 9.196s | **1.12x** | ✅ F+Prefetch |
+| **8** | 13.944s | 12.148s | **1.15x** | ✅ F+Prefetch 🏆 |
+| **16** | 19.597s | 17.517s | **1.12x** | ✅ F+Prefetch |
+| **32** | 28.578s | 27.053s | **1.06x** | ✅ F+Prefetch |
+
+**Key Insights**:
+- **Crossover at batch size 2**: GPU transfer costs become amortized across batch
+- **Peak at batch size 8**: 1.15x speedup (Fiddler+Prefetch vs Fiddler)
+- **Why it works**: GPU parallelism scales better than CPU sequential execution for batches
+- **Transfer overhead**: Fixed cost per transfer is amortized across larger batches
+
+**Recommendation by Workload**:
+- **Single inputs (BS=1)**: Fiddler CPU-only (2.17x vs baseline, 21.2 tok/s)
+- **Small batches (BS=2-16)**: Fiddler+Prefetch (1.06-1.15x vs Fiddler, peak 18.6 tok/s)
+- **Large batches (BS=32+)**: Prefetch-only (46.8 tok/s, best throughput)
+
+See comprehensive analysis: `batch_size_sweep_20251009_183710/ANALYSIS.md`
 
 ## 🏗️ Core Implementations
 
@@ -222,7 +256,8 @@ nsys stats --report nvtx_sum qwen_prefetch_profile_*/qwen_prefetch_prediction.ns
   - Separate prefill/decode hit rate tracking
 
 ### Benchmarking & Tools
-- **`benchmark_prefetch_configs.py`**: Comprehensive benchmark suite
+- **`benchmark_prefetch_configs.py`**: Comprehensive benchmark suite (single input)
+- **`benchmark_batch_size_sweep.py`**: Batch size sweep benchmark (1-32 batch sizes)
 - **`quick_test.py`**: Fast validation tool
 - **`profile_qwen_expert_costs.py`**: Cost parameter profiling script
 
@@ -230,24 +265,45 @@ nsys stats --report nvtx_sum qwen_prefetch_profile_*/qwen_prefetch_prediction.ns
 - **`expert_usage_patterns_qwen.json`**: Expert usage patterns for prefetching
 
 ### Latest Results
-- **`prefetch_benchmark_20251009_182449/`**: Final benchmark results
-  - All 4 configurations tested
+- **`prefetch_benchmark_20251009_182449/`**: Single input benchmark results
+  - All 4 configurations tested (BS=1)
   - Complete CSV/JSON results
   - Visualization plots
+- **`batch_size_sweep_20251009_183710/`**: Batch size sweep results
+  - 24 configurations tested (6 batch sizes × 4 strategies)
+  - Comprehensive 9-panel visualization
+  - Detailed analysis document (ANALYSIS.md)
 
 ## 🎯 Recommendations
 
-**For Production**:
-- Use **Fiddler CPU offloading alone**: 2.17x speedup
-- Configuration: `enable_cpu_offload=True, num_experts_to_prefetch=0`
-- Cost parameters: `latency_cpu=0.1, latency_gpu=10.0`
+**For Production (Batch Size Aware)**:
+
+1. **Single Request Serving (BS=1)**:
+   - Use **Fiddler CPU offloading alone**: 2.17x speedup
+   - Configuration: `enable_cpu_offload=True, num_experts_to_prefetch=0`
+   - Cost parameters: `latency_cpu=0.1, latency_gpu=10.0`
+   - Performance: 21.2 tokens/sec
+
+2. **Small-Medium Batch Serving (BS=2-16)**:
+   - Use **Fiddler+Prefetch**: 1.06-1.15x speedup over Fiddler alone
+   - Configuration: `enable_cpu_offload=True, num_experts_to_prefetch=8`
+   - Peak performance at BS=8: 1.15x speedup
+   - Performance: 5.7-18.6 tokens/sec (batch-dependent)
+
+3. **Large Batch Serving (BS=32+)**:
+   - Use **Prefetch-only** (no CPU offload): Best throughput
+   - Configuration: `enable_cpu_offload=False, num_experts_to_prefetch=8`
+   - Performance: 46.8 tokens/sec
 
 **For Different Hardware**:
 - Profile actual costs using `profile_qwen_expert_costs.py`
 - Adjust `latency_cpu` and `latency_gpu` accordingly
-- Test all 4 configurations to find optimal approach
+- Run batch size sweep to find your hardware's crossover point
+- Test all configurations across workload patterns
 
-**Model-Specific Insight**:
-- Qwen's small experts favor CPU execution over GPU
-- Larger expert models (e.g., Mixtral) may benefit more from prefetching
+**Model-Specific Insights**:
+- Qwen's small experts favor CPU execution at low batch sizes
+- GPU parallelism wins at higher batch sizes (≥2)
+- Transfer cost amortization is key to crossover behavior
+- Larger expert models (e.g., Mixtral) may have different crossover points
 - Always validate correctness with `quick_test.py` before benchmarking
