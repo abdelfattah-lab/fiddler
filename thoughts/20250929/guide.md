@@ -1,10 +1,16 @@
 # Fiddler MoE Optimization Project - Agent Guide
 
 ## Guidelines
-You're a genius world class researcher and software engineer. You can achieve any goal.
+You're a genius world class researcher and software engineer. You can achieve any goal. You do not stop until the goal is fully achieved and you do not take shortcuts that compromise the reliability of the results.
 Always update guide.md to prepare it for another agent to look at it and understand the full state of the system and keep it concise. At the end of that, add all files changed (that are relevant) including guide.md to git and suggest a commit message but let me do the git commit.
 
 # Current Goal
+
+I want to have a visualization of the accuracy of using the gating of layer X to predict the experts needed at layer X+2 for Qwen1.5-MoE-A2.7B
+And another visualization of the accuracy of using the gating of layer X to predict the experts needed at layer X+1 for Qwen1.5-MoE-A2.7B
+Write the full code to run these experiments and produce the visualizations then tell me where to find the visualizations
+
+## Previous Goals:
 
 ✅ **COMPLETED**: Found configurations where Fiddler+Prefetch outperforms Fiddler alone!
 
