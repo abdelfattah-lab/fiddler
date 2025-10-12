@@ -6,9 +6,55 @@ Always update guide.md to prepare it for another agent to look at it and underst
 
 # Current Goal
 
-I want to have a visualization of the accuracy of using the gating of layer X to predict the experts needed at layer X+2 for Qwen1.5-MoE-A2.7B
-And another visualization of the accuracy of using the gating of layer X to predict the experts needed at layer X+1 for Qwen1.5-MoE-A2.7B
-Write the full code to run these experiments and produce the visualizations then tell me where to find the visualizations
+**STATUS**: ✅ COMPLETED (October 10, 2025)
+
+## Latest Results: Gating Prediction Accuracy Analysis
+
+**Key Finding**: Expert selection at layer X provides **very weak prediction** of expert selection at later layers.
+
+### Results Summary
+
+**Layer X → X+1 Prediction:**
+- **Exact Match Rate**: 0.00% (no token position had identical expert sets)
+- **Average Intersection**: 0.30/4 experts (7.5% overlap)
+- **Jaccard Similarity**: 0.044 (4.4% similarity)
+
+**Layer X → X+2 Prediction:**
+- **Exact Match Rate**: 0.00% (no token position had identical expert sets)
+- **Average Intersection**: 0.25/4 experts (6.25% overlap)
+- **Jaccard Similarity**: 0.037 (3.7% similarity)
+
+### Scientific Implications
+
+1. **Gating-based prefetching is ineffective**: Using layer X's gating decisions to predict layer X+2 would only achieve ~6% accuracy, far below what's needed for effective prefetching.
+
+2. **Pattern-based prefetching is superior**: The current implementation uses historical token-position-based patterns (`expert_usage_patterns_qwen.json`), which achieves 100% decode hit rate. This demonstrates that expert selection is more dependent on token position than on previous layer's gating.
+
+3. **Model architecture insight**: The very low correlation between consecutive layers suggests that Qwen's MoE routing is highly dynamic and layer-specific, with each layer making independent routing decisions based on the hidden state.
+
+### Files Created
+
+- **`analyze_gating_prediction_accuracy.py`**: Complete analysis tool
+  - Collects actual gating decisions across all layers during generation
+  - Calculates exact match, intersection, and Jaccard similarity metrics
+  - Produces comprehensive visualizations
+
+- **`gating_analysis/gating_prediction_accuracy_20251010_202209.png`**: Visual analysis
+  - 2×3 grid showing all metrics for both X→X+1 and X→X+2 predictions
+  - Layer-by-layer breakdown of prediction accuracy
+
+- **`gating_analysis/gating_prediction_results_20251010_202223.json`**: Detailed numerical results
+
+### Usage
+
+```bash
+# Run the complete analysis
+python analyze_gating_prediction_accuracy.py
+
+# Results are saved to gating_analysis/ directory
+# Visualization: gating_analysis/gating_prediction_accuracy_*.png
+# JSON results: gating_analysis/gating_prediction_results_*.json
+```
 
 ## Previous Goals:
 
@@ -266,6 +312,10 @@ nsys stats --report nvtx_sum qwen_prefetch_profile_*/qwen_prefetch_prediction.ns
 - **`benchmark_batch_size_sweep.py`**: Batch size sweep benchmark (1-32 batch sizes)
 - **`quick_test.py`**: Fast validation tool
 - **`profile_qwen_expert_costs.py`**: Cost parameter profiling script
+- **`analyze_gating_prediction_accuracy.py`**: Gating prediction accuracy analysis
+  - Measures how well layer X's gating predicts layers X+1 and X+2
+  - Calculates exact match, intersection, and Jaccard similarity metrics
+  - Generates comprehensive visualizations
 
 ### Data Files
 - **`expert_usage_patterns_qwen.json`**: Expert usage patterns for prefetching
@@ -279,6 +329,10 @@ nsys stats --report nvtx_sum qwen_prefetch_profile_*/qwen_prefetch_prediction.ns
   - 24 configurations tested (6 batch sizes × 4 strategies)
   - Comprehensive 9-panel visualization
   - Detailed analysis document (ANALYSIS.md)
+- **`gating_analysis/`**: Gating prediction accuracy analysis (October 10, 2025)
+  - X→X+1 and X→X+2 prediction accuracy measurements
+  - Shows only 6-7.5% expert overlap between consecutive layers
+  - Validates pattern-based prefetching over gating-based approaches
 
 ## 🎯 Recommendations
 
