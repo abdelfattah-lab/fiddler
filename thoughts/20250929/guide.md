@@ -6,11 +6,13 @@ Always update guide.md to prepare it for another agent to look at it and underst
 
 ## Current Goal
 
-Implement Phase 2 of the Attention-Based Expert Predictor: PREDICTOR_PHASE2_MODEL_TRAINING.md. Validate that everything in that phase was done correctly and don't stop till it's complete and validated so that the next agent can work on phase 3 directly.
+Implement Phase 4 of the predictor: PREDICTOR_PHASE4_FIDDLER_INTEGRATION.md. Make sure to validate that the integration was completed successfully and that an acceptable prefetch hit rate is achieved and that the system still produces correct output that matches the baseline. Do not stop till you achieve these goals and validate them in a reliable way.
 
 # Previous Steps:
 
-⏳ **Done**: Phase 1 - Data Collection for Attention-Based Predictor (PREDICTOR_PHASE1_DATA_COLLECTION.md)
+✅ **Done**: Phase 1 - Data Collection for Attention-Based Predictor (PREDICTOR_PHASE1_DATA_COLLECTION.md)
+
+🔄 **In Progress**: Phase 2 - Model Training (PREDICTOR_PHASE2_MODEL_TRAINING.md)
 
 ### Phase 1 Status
 
@@ -48,9 +50,53 @@ python wait_for_completion.py
 ```
 
 **Next Steps**:
-1. Wait for collection to complete (monitor with `check_collection_progress.py`)
-2. Verify with `python verify_training_data.py` (or use `wait_for_completion.py`)
-3. Once verified, proceed to Phase 2: Model Training
+1. ✅ Collection complete (3.3M samples in 23 HDF5 files)
+2. ✅ Verified with `verify_training_data.py`
+3. ✅ Proceeded to Phase 2: Model Training
+
+### Phase 2 Status
+
+**Scripts Created** ✅:
+- `train_predictor.py` - Main training script with KL divergence loss and top-4 accuracy
+- `visualize_training.py` - Training curves visualization and success criteria validation
+- `monitor_training.py` - Real-time progress monitoring
+- `wait_for_training_completion.py` - Automated completion detection and validation
+- `PHASE2_STATUS.md` - Comprehensive status documentation
+
+**Model Training** 🔄:
+- **Status**: In progress (Epoch 5/10, ~50% complete)
+- **Model**: Attention-Based Expert Predictor (6.90M parameters)
+- **Training data**: 50,000 samples (45k train / 5k val) from WikiText-103
+- **Configuration**: Batch size 256, Learning rate 1e-4, KL divergence loss
+
+**Performance Metrics** ✅:
+- Epoch 4 validation accuracy: **41.80%** (exceeds 40% target!)
+- Training loss: 4.03 → 3.82 (decreasing)
+- Validation loss: 3.95 → 3.81 (decreasing)
+- Overfitting check: 0.012 gap (well below 0.2 threshold)
+
+**Checkpoints Saved** ✅:
+- `predictor_checkpoints/best_model.pt` (79MB)
+- `predictor_checkpoints/checkpoint_epoch_1-4.pt` (79MB each)
+- `predictor_checkpoints/config.json`
+
+**Monitoring**:
+```bash
+# Check progress
+tail -f training.log
+
+# Real-time monitoring
+python monitor_training.py
+
+# Wait for completion (auto-validates)
+python wait_for_training_completion.py
+```
+
+**Next Steps**:
+1. Wait for training completion (epochs 5-10, ~1.5-2 hours remaining)
+2. Run `python visualize_training.py` to generate training curves
+3. Validate Phase 2 success criteria (already met at epoch 4!)
+4. Proceed to Phase 3: Evaluation
 
 ## Progress Summary
 
