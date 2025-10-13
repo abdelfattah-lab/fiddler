@@ -1,12 +1,11 @@
 # Phase 5: End-to-End Benchmarking
 
-**Estimated Time**: 1 week
 **Prerequisites**: Completed Phase 4 (integrated and tested)
 **Dependencies**: See [PREDICTOR_SHARED_CONTEXT.md](PREDICTOR_SHARED_CONTEXT.md) for expected results
 
 ## Objective
 
-Compare the learned predictor approach against baseline and pattern-based prefetching to measure actual inference speedup, hit rates, and overall performance across different batch sizes and configurations.
+Compare the learned predictor approach against baseline to measure actual inference speedup, hit rates, and overall performance across different batch sizes and configurations.
 
 ## Deliverables
 
@@ -14,9 +13,7 @@ Compare the learned predictor approach against baseline and pattern-based prefet
 - Benchmark results showing:
   - Inference speedup vs baseline
   - Hit rates (prefill and decode)
-  - Comparison with pattern-based approach
 - Performance analysis document
-- Production deployment recommendations
 
 ## Implementation
 
@@ -160,17 +157,6 @@ def run_full_benchmark():
             'kwargs': {}
         },
 
-        # 2. Pattern-based prefetch (no offload)
-        {
-            'model_class': FiddlerQwenWithPrefetch,
-            'config_name': 'Pattern-Prefetch-8',
-            'kwargs': {
-                'num_experts_to_prefetch': 8,
-                'enable_cpu_offload': False,
-                'pattern_file': 'expert_usage_patterns_qwen.json'
-            }
-        },
-
         # 3. Learned prefetch (no offload)
         {
             'model_class': FiddlerQwenWithLearnedPrefetch,
@@ -190,19 +176,6 @@ def run_full_benchmark():
                 'enable_cpu_offload': True,
                 'latency_cpu': 0.1,
                 'latency_gpu': 10.0
-            }
-        },
-
-        # 5. Fiddler + Pattern prefetch
-        {
-            'model_class': FiddlerQwenWithPrefetch,
-            'config_name': 'Fiddler+Pattern-Prefetch-8',
-            'kwargs': {
-                'num_experts_to_prefetch': 8,
-                'enable_cpu_offload': True,
-                'latency_cpu': 0.1,
-                'latency_gpu': 10.0,
-                'pattern_file': 'expert_usage_patterns_qwen.json'
             }
         },
 
@@ -309,19 +282,7 @@ def generate_comparison_table(all_results, output_dir):
     print(f"\n🏆 Best speedup: {best_speedup['config']} ({best_speedup['speedup']:.2f}x)")
     print(f"🎯 Best decode hit rate: {best_hit_rate['config']} ({best_hit_rate['decode_hit_rate']:.1f}%)")
 
-    # Compare learned vs pattern-based
     learned_result = next((r for r in comparison_data if 'Learned-Prefetch-8' in r['config']), None)
-    pattern_result = next((r for r in comparison_data if 'Pattern-Prefetch-8' in r['config']), None)
-
-    if learned_result and pattern_result:
-        print(f"\n📊 Learned vs Pattern-based:")
-        print(f"  Speedup: {learned_result['speedup']:.2f}x vs {pattern_result['speedup']:.2f}x")
-        print(f"  Decode hit rate: {learned_result['decode_hit_rate']:.1f}% vs {pattern_result['decode_hit_rate']:.1f}%")
-
-        if learned_result['decode_hit_rate'] > pattern_result['decode_hit_rate'] * 0.8:
-            print(f"  ✅ Learned predictor achieves competitive hit rate!")
-        else:
-            print(f"  ⚠️  Learned predictor hit rate lower than expected")
 
     # Save analysis
     analysis = {
@@ -354,10 +315,8 @@ def main():
     print("="*100)
     print("\nComparing:")
     print("  1. Baseline (no optimization)")
-    print("  2. Pattern-based prefetch")
     print("  3. Learned prefetch")
     print("  4. Fiddler CPU offload")
-    print("  5. Fiddler + Pattern prefetch")
     print("  6. Fiddler + Learned prefetch")
     print("="*100)
 

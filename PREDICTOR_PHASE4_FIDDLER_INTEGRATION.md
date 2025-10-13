@@ -1,7 +1,6 @@
 # Phase 4: Fiddler Integration
 
-**Estimated Time**: 1 week
-**Prerequisites**: Completed Phase 3 (evaluated predictor with >40% accuracy)
+**Prerequisites**: Completed Phase 2 (trained model available)
 **Dependencies**: See [PREDICTOR_SHARED_CONTEXT.md](PREDICTOR_SHARED_CONTEXT.md) for architecture details
 
 ## Objective

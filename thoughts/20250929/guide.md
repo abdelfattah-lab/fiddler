@@ -6,7 +6,9 @@ Always update guide.md to prepare it for another agent to look at it and underst
 
 ## Current Goal
 
-✅ **COMPLETED**: Phase 4 - Fiddler Integration (PREDICTOR_PHASE4_FIDDLER_INTEGRATION.md)
+Implement Phase 5 of the predictor: PREDICTOR_PHASE5_BENCHMARKING.md. Make sure to validate the results. The goal is to show a configuration where prediction + Fiddler outperforms Fiddler alone. Don't stop till you produce that result with valid reliable experiments that are methodologically sound.
+
+## Previous Goals
 
 **Status**: Implementation complete. Ready for testing once training finishes.
 

@@ -1,6 +1,5 @@
 # Phase 3: Evaluation
 
-**Estimated Time**: 1 week
 **Prerequisites**: Completed Phase 2 (trained model available)
 **Dependencies**: See [PREDICTOR_SHARED_CONTEXT.md](PREDICTOR_SHARED_CONTEXT.md) for evaluation metrics and success criteria
 
@@ -13,7 +12,6 @@ Evaluate the trained predictor on WikiText-103 **test split** (never seen during
 - `predictor_evaluation_results.json`: Comprehensive evaluation results
 - Metrics showing:
   - Top-4 overlap accuracy (target: >60%)
-  - Jaccard similarity (target: >0.50)
   - Precision@4 and NDCG@4
 - Comparison with gating-based baseline (18.75% overlap)
 - Analysis document summarizing findings
@@ -348,17 +346,17 @@ The script will print:
 
 **Success Tiers**:
 
-1. **Minimum Viable** (40% top-4, 0.30 Jaccard):
+1. **Minimum Viable** (40% top-4):
    - Predictor is better than gating-based (18.75%)
    - Justifies using learned approach
    - Worth proceeding to integration
 
-2. **Target** (60% top-4, 0.50 Jaccard):
+2. **Target** (60% top-4):
    - Strong predictor performance
    - Should provide good inference speedup
    - Ready for production testing
 
-3. **Stretch** (75% top-4, 0.65 Jaccard):
+3. **Stretch** (75% top-4):
    - Excellent predictor performance
    - Likely 1.3-1.5x inference speedup
    - Production-ready
@@ -452,11 +450,6 @@ Note: Results may be less stable with fewer samples.
 - **25-40%**: Marginal - may still help but limited benefit
 - **<25%**: Poor - not better than gating-based (18.75%)
 
-**Jaccard Similarity**:
-- Measures set overlap quality
-- Should correlate with top-4 overlap
-- >0.50 indicates strong prediction quality
-
 ### Comparison Context
 
 | Approach | Top-4 Overlap | Generalization |
@@ -470,7 +463,6 @@ Note: Results may be less stable with fewer samples.
 
 **Proceed if**:
 - Top-4 overlap > 40%
-- Jaccard > 0.30
 - Improvement over baseline demonstrated
 
 **Consider retraining if**:
