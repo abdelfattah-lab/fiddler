@@ -118,68 +118,20 @@ def get_diverse_batch(batch_size: int, seed: int = None) -> List[str]:
 def run_single_batch_baseline(model, prompts: List[str], output_tokens: int = 20) -> Dict:
     """
     Run baseline or Fiddler (single GPU buffer) on a batch.
-    For batch_size=1, use generate(). For batch>1, use manual batching.
+    Now uses the generate() method for all batch sizes (single string or list of strings).
     """
     batch_size = len(prompts)
 
+    # Use generate method with proper input (single string or list of strings)
     if batch_size == 1:
-        # Use generate method
-        prefill_time, decode_time, prefill_hit_rate, decode_hit_rate = model.generate(
-            prompts[0],
-            output_token=output_tokens
-        )
+        text_input = prompts[0]
     else:
-        # Manual batching
-        inputs = model.tokenizer(prompts, return_tensors="pt", padding=True)
-        input_ids = inputs.input_ids.to(model.model.device)
-        attention_mask = inputs.attention_mask.to(model.model.device)
+        text_input = prompts
 
-        # Reset stats
-        model.expert_fetch_count = 0
-        model.expert_hit_count = 0
-
-        # Generate tokens
-        generated = input_ids
-        prefill_time = 0.0
-        decode_time = 0.0
-
-        for i in range(output_tokens):
-            with torch.no_grad():
-                is_decode = (i > 0)
-
-                torch.cuda.synchronize()
-                step_start = time.time()
-
-                outputs = model.model(
-                    input_ids=generated,
-                    attention_mask=attention_mask,
-                    use_cache=False
-                )
-
-                torch.cuda.synchronize()
-                step_time = time.time() - step_start
-
-                if is_decode:
-                    decode_time += step_time
-                else:
-                    prefill_time = step_time
-
-                # Get next token
-                next_token_logits = outputs.logits[:, -1, :]
-                next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-
-                # Append to generated sequence
-                generated = torch.cat([generated, next_tokens], dim=-1)
-
-                # Update attention mask
-                attention_mask = torch.cat([
-                    attention_mask,
-                    torch.ones((batch_size, 1), device=attention_mask.device)
-                ], dim=-1)
-
-        # No hit rates for baseline
-        prefill_hit_rate = 0.0
-        decode_hit_rate = 0.0
+    prefill_time, decode_time, prefill_hit_rate, decode_hit_rate = model.generate(
+        text_input,
+        output_token=output_tokens
+    )
 
     return {
         'prefill_time': prefill_time,
@@ -194,96 +146,20 @@ def run_single_batch_baseline(model, prompts: List[str], output_tokens: int = 20
 def run_single_batch_learned(model, prompts: List[str], output_tokens: int = 20) -> Dict:
     """
     Run learned prefetch model on a batch.
-    For batch_size=1, use generate(). For batch>1, use manual batching.
+    Now uses the generate() method for all batch sizes (single string or list of strings).
     """
     batch_size = len(prompts)
 
+    # Use generate method with proper input (single string or list of strings)
     if batch_size == 1:
-        # Use generate method
-        prefill_time, decode_time, prefill_hit_rate, decode_hit_rate = model.generate(
-            prompts[0],
-            output_token=output_tokens
-        )
+        text_input = prompts[0]
     else:
-        # Manual batching with hit rate tracking
-        inputs = model.tokenizer(prompts, return_tensors="pt", padding=True)
-        input_ids = inputs.input_ids.to(model.model.device)
-        attention_mask = inputs.attention_mask.to(model.model.device)
+        text_input = prompts
 
-        # Reset stats
-        if hasattr(model, 'expert_fetch_count'):
-            model.expert_fetch_count = 0
-            model.expert_hit_count = 0
-            model.cnt_expert_hit = 0
-            model.cnt_expert_all = 0
-            model.prefill_hit_count = 0
-            model.prefill_total = 0
-            model.decode_hit_count = 0
-            model.decode_total = 0
-
-        # Reset prefetch caches
-        if hasattr(model, 'prefetch_cache_A'):
-            model.prefetch_cache_A.clear()
-            model.prefetch_cache_B.clear()
-            model.expert_ready_events.clear()
-
-        # Reset attention capture
-        if hasattr(model, 'current_attention_output'):
-            model.current_attention_output = None
-
-        # Reset profiler token position
-        if hasattr(model, 'profiler') and not model.collection_mode:
-            model.profiler.current_token_pos = 0
-
-        # Generate tokens
-        generated = input_ids
-        prefill_time = 0.0
-        decode_time = 0.0
-
-        for i in range(output_tokens):
-            with torch.no_grad():
-                is_decode = (i > 0)
-
-                torch.cuda.synchronize()
-                step_start = time.time()
-
-                outputs = model.model(
-                    input_ids=generated,
-                    attention_mask=attention_mask,
-                    use_cache=False
-                )
-
-                torch.cuda.synchronize()
-                step_time = time.time() - step_start
-
-                if is_decode:
-                    decode_time += step_time
-                else:
-                    prefill_time = step_time
-
-                # Get next token
-                next_token_logits = outputs.logits[:, -1, :]
-                next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-
-                # Append to generated sequence
-                generated = torch.cat([generated, next_tokens], dim=-1)
-
-                # Update attention mask
-                attention_mask = torch.cat([
-                    attention_mask,
-                    torch.ones((batch_size, 1), device=attention_mask.device)
-                ], dim=-1)
-
-        # Calculate hit rates
-        if hasattr(model, 'prefill_total') and model.prefill_total > 0:
-            prefill_hit_rate = model.prefill_hit_count / model.prefill_total
-        else:
-            prefill_hit_rate = 0.0
-
-        if hasattr(model, 'decode_total') and model.decode_total > 0:
-            decode_hit_rate = model.decode_hit_count / model.decode_total
-        else:
-            decode_hit_rate = 0.0
+    prefill_time, decode_time, prefill_hit_rate, decode_hit_rate = model.generate(
+        text_input,
+        output_token=output_tokens
+    )
 
     return {
         'prefill_time': prefill_time,
