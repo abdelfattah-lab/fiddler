@@ -173,52 +173,83 @@ class FiddlerQwenWithLearnedPrefetch(FiddlerQwenWithPrefetch):
         # Handle both 3D and 4D output from predictor
         if len(predicted_logits.shape) == 3:
             # Output is [seq_len, 22, 60] - batch dimension was removed
-            seq_len = predicted_logits.shape[0]
-            layer_logits = predicted_logits[:, output_idx, :]  # [seq_len, 60]
-        else:
-            # Output is [batch, seq_len, 22, 60]
-            batch_size, seq_len, _, _ = predicted_logits.shape
-            layer_logits = predicted_logits[0, :, output_idx, :]  # [seq_len, 60]
+            # Add batch dimension for uniform handling
+            predicted_logits = predicted_logits.unsqueeze(0)  # [1, seq_len, 22, 60]
 
-        seq_len = layer_logits.shape[0]
+        # Now predicted_logits is always [batch, seq_len, 22, 60]
+        batch_size, seq_len, _, _ = predicted_logits.shape
+        layer_logits = predicted_logits[:, :, output_idx, :]  # [batch, seq_len, 60]
 
         # Determine aggregation strategy based on phase
         if seq_len == 1:
-            # Decode phase: single token prediction
-            logits = layer_logits[0, :]  # [60]
-            num_to_prefetch = min(self.num_experts_to_prefetch, self.n_expert)
-            _, top_k_indices = torch.topk(logits, k=num_to_prefetch)
-            predicted_experts = top_k_indices.cpu().tolist()
+            # Decode phase: aggregate across batch elements using frequency counting
+            predicted_experts = self._aggregate_batch_predictions(
+                layer_logits.squeeze(1),  # [batch, 60]
+                self.num_experts_to_prefetch
+            )
         else:
-            # Prefill phase: aggregate across multiple tokens
+            # Prefill phase: aggregate across both batch and sequence dimensions
             predicted_experts = self._aggregate_prefill_predictions(
-                layer_logits,
+                layer_logits,  # [batch, seq_len, 60]
                 self.num_experts_to_prefetch
             )
 
         return predicted_experts
 
-    def _aggregate_prefill_predictions(self, layer_logits, k):
+    def _aggregate_batch_predictions(self, layer_logits, k):
         """
-        Aggregate expert predictions across multiple tokens during prefill.
+        Aggregate expert predictions across batch elements during decode phase.
+
+        For each batch element, get the top-k experts, then count how many times
+        each expert appears across all batch elements, and select the k most
+        frequent experts.
 
         Args:
-            layer_logits: [seq_len, 60] - predicted logits for each token
+            layer_logits: [batch, 60] - predicted logits for each batch element
             k: number of experts to select
 
         Returns:
             List of k expert indices to prefetch
         """
-        seq_len, n_experts = layer_logits.shape
+        batch_size, n_experts = layer_logits.shape
+
+        # For each batch element, get top-4 experts (matching Qwen's gating top_k=4)
+        top_k_per_element = 4  # Match Qwen's gating top-k
+        _, top_experts_per_element = torch.topk(layer_logits, k=top_k_per_element, dim=1)  # [batch, 4]
+
+        # Count frequency of each expert across all batch elements
+        expert_counts = torch.zeros(n_experts, dtype=torch.long, device=layer_logits.device)
+        for batch_experts in top_experts_per_element:
+            for expert_idx in batch_experts:
+                expert_counts[expert_idx] += 1
+
+        # Select top-k most frequent experts
+        _, top_k_by_frequency = torch.topk(expert_counts, k=min(k, n_experts))
+        return top_k_by_frequency.cpu().tolist()
+
+    def _aggregate_prefill_predictions(self, layer_logits, k):
+        """
+        Aggregate expert predictions across batch and sequence dimensions during prefill.
+
+        Args:
+            layer_logits: [batch, seq_len, 60] - predicted logits for each batch and token
+            k: number of experts to select
+
+        Returns:
+            List of k expert indices to prefetch
+        """
+        batch_size, seq_len, n_experts = layer_logits.shape
 
         if self.prefill_aggregation == 'frequency':
             # Strategy 1: Frequency-based (most principled)
-            # For each token, get top-4 experts (matching Qwen's top_k=4)
-            # Then select the k most frequent experts across all tokens
+            # For each token in each batch, get top-4 experts (matching Qwen's top_k=4)
+            # Then select the k most frequent experts across all batch elements and tokens
             top_k_per_token = 4  # Match Qwen's gating top-k
-            _, top_experts_per_token = torch.topk(layer_logits, k=top_k_per_token, dim=1)  # [seq_len, 4]
+            # Reshape to [batch*seq_len, n_experts] for easier processing
+            layer_logits_flat = layer_logits.reshape(-1, n_experts)  # [batch*seq_len, 60]
+            _, top_experts_per_token = torch.topk(layer_logits_flat, k=top_k_per_token, dim=1)  # [batch*seq_len, 4]
 
-            # Count frequency of each expert across all tokens
+            # Count frequency of each expert across all batch elements and tokens
             expert_counts = torch.zeros(n_experts, dtype=torch.long, device=layer_logits.device)
             for token_experts in top_experts_per_token:
                 for expert_idx in token_experts:
@@ -229,22 +260,22 @@ class FiddlerQwenWithLearnedPrefetch(FiddlerQwenWithPrefetch):
             return top_k_by_frequency.cpu().tolist()
 
         elif self.prefill_aggregation == 'mean':
-            # Strategy 2: Mean pooling (original approach)
-            # Average scores across tokens
-            mean_logits = layer_logits.mean(dim=0)  # [60]
+            # Strategy 2: Mean pooling (average scores across batch and tokens)
+            mean_logits = layer_logits.mean(dim=(0, 1))  # [60]
             _, top_k_indices = torch.topk(mean_logits, k=min(k, n_experts))
             return top_k_indices.cpu().tolist()
 
         elif self.prefill_aggregation == 'max':
-            # Strategy 3: Max pooling
-            # Take maximum score across tokens (experts needed by ANY token)
-            max_logits, _ = layer_logits.max(dim=0)  # [60]
+            # Strategy 3: Max pooling (experts needed by ANY batch element or token)
+            # First max over seq_len, then max over batch
+            max_logits = layer_logits.max(dim=1)[0]  # [batch, 60]
+            max_logits = max_logits.max(dim=0)[0]  # [60]
             _, top_k_indices = torch.topk(max_logits, k=min(k, n_experts))
             return top_k_indices.cpu().tolist()
 
         else:
             # Fallback to mean pooling
-            mean_logits = layer_logits.mean(dim=0)
+            mean_logits = layer_logits.mean(dim=(0, 1))  # [60]
             _, top_k_indices = torch.topk(mean_logits, k=min(k, n_experts))
             return top_k_indices.cpu().tolist()
 
