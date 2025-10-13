@@ -6,7 +6,51 @@ Always update guide.md to prepare it for another agent to look at it and underst
 
 ## Current Goal
 
-No active goal - predictor implementation plan has been split into modular documents.
+Implement Phase 2 of the Attention-Based Expert Predictor: PREDICTOR_PHASE2_MODEL_TRAINING.md. Validate that everything in that phase was done correctly and don't stop till it's complete and validated so that the next agent can work on phase 3 directly.
+
+# Previous Steps:
+
+⏳ **Done**: Phase 1 - Data Collection for Attention-Based Predictor (PREDICTOR_PHASE1_DATA_COLLECTION.md)
+
+### Phase 1 Status
+
+**Scripts Created** ✅:
+- `collect_training_data.py` - Data collection from WikiText-103 train split
+- `verify_training_data.py` - Comprehensive data validation
+- `check_collection_progress.py` - Real-time progress monitoring
+- `wait_for_completion.py` - Automated completion detection and verification
+
+**Test Collection** ✅:
+- Successfully tested on 100 samples
+- Generated 7,500 tokens with correct format
+- All validation checks passed:
+  - Attention outputs: [n, 2048] float32
+  - Gating scores: [n, 22, 60] float32 (complete probability distributions)
+  - Data integrity: No NaN/Inf, valid probability sums
+
+**Full Collection** 🔄:
+- **Status**: Running in background (started: check `data_collection.log`)
+- **Target**: 50,000 samples from WikiText-103 train split
+- **Expected duration**: 5-7 hours (~2-3 samples/sec)
+- **Output**: `predictor_training_data/` directory (~660MB total)
+- **Format**: ~50 HDF5 files, 1,000 samples per file
+
+**Monitoring**:
+```bash
+# Check progress
+python check_collection_progress.py
+
+# View log
+tail -f data_collection.log
+
+# Wait for completion (auto-runs verification)
+python wait_for_completion.py
+```
+
+**Next Steps**:
+1. Wait for collection to complete (monitor with `check_collection_progress.py`)
+2. Verify with `python verify_training_data.py` (or use `wait_for_completion.py`)
+3. Once verified, proceed to Phase 2: Model Training
 
 ## Progress Summary
 

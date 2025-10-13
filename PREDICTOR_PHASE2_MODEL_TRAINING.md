@@ -1,12 +1,11 @@
 # Phase 2: Model Training
 
-**Estimated Time**: 1 week
 **Prerequisites**: Completed Phase 1 (training data collected)
 **Dependencies**: See [PREDICTOR_SHARED_CONTEXT.md](PREDICTOR_SHARED_CONTEXT.md) for architecture and training specifications
 
 ## Objective
 
-Train the attention-based expert predictor using the collected training data to predict which experts will be selected in MoE layers 2-23, based on first layer attention outputs.
+Train the attention-based expert predictor using the collected training data to predict which experts will be selected in MoE layers 2-23, based on first layer attention outputs. Add wandb logging for monitoring.
 
 ## Deliverables
 
@@ -15,7 +14,7 @@ Train the attention-based expert predictor using the collected training data to 
   - `checkpoint_epoch_*.pt`: Per-epoch checkpoints
   - `config.json`: Training configuration
 - Training logs showing:
-  - Top-4 accuracy > 40% on validation set
+  - Top-4 accuracy > 60% on validation set
   - Training and validation loss decreasing
 - Model ready for Phase 3 evaluation
 
@@ -607,5 +606,3 @@ Once training is complete and verified:
   - Success criteria
 
 ---
-
-**Estimated Completion Time**: 1 week (including setup, training runs, debugging, and verification)
