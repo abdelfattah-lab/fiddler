@@ -6,7 +6,7 @@ Always update guide.md to prepare it for another agent to look at it and underst
 
 ## Current Goal
 
-Implement Phase 5 of the predictor: PREDICTOR_PHASE5_BENCHMARKING.md. Make sure to validate the results. The goal is to show a configuration where prediction + Fiddler outperforms Fiddler alone. Don't stop till you produce that result with valid reliable experiments that are methodologically sound.
+Revisit the predictor integration. Right now, the way it supports batch sizes > 1 during decoding is that it ignores all elements of the batch except the first one. This is not ideal. Instead, it should predict experts for all elements in the batch and for choosing the top-k experts, it should choose the ones that would be picked by most of the tokens. So, it first sees the top-k experts for each token in the batch, then it counts how many times each expert was picked, and finally it picks the k experts with the highest counts. This way, it can leverage the predictor better for batch sizes > 1. Make sure to validate that the implementation is correct and that it works as intended with reliable tests and validation and make sure the correctness tests pass as well. Do not stop till you achieve these results.
 
 ## Previous Goals
 
