@@ -6,6 +6,10 @@ Always update guide.md to prepare it for another agent to look at it and underst
 
 ## Current Goal
 
+Implement Phase 5 of the predictor: PREDICTOR_PHASE5_BENCHMARKING.md. Make sure to validate the results. The goal is to show a configuration where prediction + Fiddler outperforms Fiddler alone. Don't stop till you produce that result with valid reliable experiments that are methodologically sound. Note that it is likely that the configuration that leads to that is of high batch size. Make sure when testing higher batch size that the sentences used are different and not the same. Do not stop till you achieve that goal and validate it. Use methods that are reliable and verify them. The results will be used to write a research paper.
+
+## Previous Goals
+
 **Status**: ✅ COMPLETED
 
 Successfully improved predictor integration to handle batch sizes > 1 properly:
@@ -29,7 +33,6 @@ Successfully improved predictor integration to handle batch sizes > 1 properly:
 
 **Next Goal**: Ready for production use or further Phase 5 benchmarking with different batch sizes.
 
-## Previous Goals
 
 **Status**: Implementation complete. Ready for testing once training finishes.
 
