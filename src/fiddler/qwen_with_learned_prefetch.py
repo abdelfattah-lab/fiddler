@@ -86,12 +86,22 @@ class FiddlerQwenWithLearnedPrefetch(FiddlerQwenWithPrefetch):
         # Storage for current attention output
         self.current_attention_output = None
 
+        # Cache for predictor outputs (to avoid running predictor multiple times per forward pass)
+        # Maps layer_idx -> list of expert indices
+        self.cached_predictions = {}
+
+        # Create separate CUDA stream for asynchronous predictor execution
+        self.predictor_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        self.predictor_ready_event = None  # Event to track when predictor completes
+
         # Aggregation strategy for prefill phase
         self.prefill_aggregation = prefill_aggregation
 
         print("✅ Learned prefetch model initialized")
         print(f"🔮 Using learned predictor with {num_experts_to_prefetch} experts per layer")
         print(f"🔮 Prefill aggregation strategy: {prefill_aggregation}")
+        if self.predictor_stream:
+            print(f"⚡ Async predictor stream initialized (non-blocking execution)")
         print("="*80)
 
     def _load_predictor(self, predictor_path):
@@ -123,49 +133,56 @@ class FiddlerQwenWithLearnedPrefetch(FiddlerQwenWithPrefetch):
         print(f"   Validation Top-4 Accuracy: {checkpoint['val_acc']*100:.2f}%")
 
     def _register_attention_hook(self):
-        """Register hook to capture first layer attention output."""
+        """Register hook to capture first layer attention output and run predictor asynchronously."""
         def attention_hook(module, input, output):
             # Capture attention output for predictor
             # output is a tuple: (hidden_states, attention_weights, ...)
             # We want hidden_states which is output[0]
             self.current_attention_output = output[0].detach()  # [batch, seq_len, hidden_dim]
 
+            # EAGER ASYNC EXECUTION: Run predictor immediately in separate stream
+            # This allows predictions to compute in parallel with layer processing
+            # The main thread is NOT blocked - predictor runs asynchronously
+            self._run_predictor_and_cache_async()
+
         # Register on layer 0 self-attention
         self.model.model.layers[0].self_attn.register_forward_hook(attention_hook)
-        print("✅ Attention hook registered on layer 0")
+        print("✅ Attention hook registered on layer 0 (eager async predictor execution)")
 
-    def _predict_experts_for_layer(self, layer_idx, token_pos):
+    def _run_predictor_and_cache_async(self):
         """
-        Predict which experts will be needed for this layer using learned predictor.
-
-        Args:
-            layer_idx: MoE layer index (2-23 for Qwen)
-            token_pos: Token position (for decode phase)
-
-        Returns:
-            List of expert indices to prefetch
+        Run predictor asynchronously in separate CUDA stream.
+        This is called eagerly in the attention hook and does NOT block the main thread.
         """
         # Check if we have attention output from layer 0
         if self.current_attention_output is None:
-            # No attention output yet (shouldn't happen in normal flow)
-            # Return empty list to skip prefetch
-            return []
+            # No attention output yet - cannot make predictions
+            return
 
-        # Check if this layer is one we predict for (layers 2-23)
-        if layer_idx not in self.moe_layers[2:]:
-            return []
+        # If we don't have a separate stream, fall back to synchronous execution
+        if self.predictor_stream is None:
+            self._run_predictor_and_cache()
+            return
 
-        # Map layer_idx to predictor output index
-        # Predictor predicts for layers 2-23 (indices 0-21 in output)
-        # So layer_idx=2 -> output_idx=0, layer_idx=3 -> output_idx=1, etc.
-        moe_layer_position = self.moe_layers.index(layer_idx)  # Position in moe_layers list
-        output_idx = moe_layer_position - 2  # Subtract 2 because we skip first 2 MoE layers
+        # Run predictor in separate stream (non-blocking)
+        with torch.cuda.stream(self.predictor_stream):
+            self._run_predictor_and_cache()
 
-        if output_idx < 0 or output_idx >= 22:
-            # Outside prediction range
-            return []
+            # Record event to track completion
+            self.predictor_ready_event = torch.cuda.Event()
+            self.predictor_ready_event.record(self.predictor_stream)
 
-        # Run predictor
+    def _run_predictor_and_cache(self):
+        """
+        Run predictor once and cache predictions for all layers.
+        Called either synchronously (if no stream) or asynchronously (in predictor_stream).
+        """
+        # Check if we have attention output from layer 0
+        if self.current_attention_output is None:
+            # No attention output yet - cannot make predictions
+            return
+
+        # Run predictor once for all layers
         with torch.no_grad():
             attention_output = self.current_attention_output  # [batch, seq_len, 2048]
             predicted_logits = self.predictor(attention_output)  # [seq_len, 22, 60] or [batch, seq_len, 22, 60]
@@ -177,24 +194,62 @@ class FiddlerQwenWithLearnedPrefetch(FiddlerQwenWithPrefetch):
             predicted_logits = predicted_logits.unsqueeze(0)  # [1, seq_len, 22, 60]
 
         # Now predicted_logits is always [batch, seq_len, 22, 60]
-        batch_size, seq_len, _, _ = predicted_logits.shape
-        layer_logits = predicted_logits[:, :, output_idx, :]  # [batch, seq_len, 60]
+        batch_size, seq_len, n_layers, n_experts = predicted_logits.shape
 
-        # Determine aggregation strategy based on phase
-        if seq_len == 1:
-            # Decode phase: aggregate across batch elements using frequency counting
-            predicted_experts = self._aggregate_batch_predictions(
-                layer_logits.squeeze(1),  # [batch, 60]
-                self.num_experts_to_prefetch
-            )
-        else:
-            # Prefill phase: aggregate across both batch and sequence dimensions
-            predicted_experts = self._aggregate_prefill_predictions(
-                layer_logits,  # [batch, seq_len, 60]
-                self.num_experts_to_prefetch
-            )
+        # Determine if we're in decode or prefill phase
+        is_decode_phase = (seq_len == 1)
 
-        return predicted_experts
+        # Process predictions for each layer and cache them
+        for output_idx in range(n_layers):
+            layer_logits = predicted_logits[:, :, output_idx, :]  # [batch, seq_len, 60]
+
+            # Determine aggregation strategy based on phase
+            if is_decode_phase:
+                # Decode phase: aggregate across batch elements using frequency counting
+                predicted_experts = self._aggregate_batch_predictions(
+                    layer_logits.squeeze(1),  # [batch, 60]
+                    self.num_experts_to_prefetch
+                )
+            else:
+                # Prefill phase: aggregate across both batch and sequence dimensions
+                predicted_experts = self._aggregate_prefill_predictions(
+                    layer_logits,  # [batch, seq_len, 60]
+                    self.num_experts_to_prefetch
+                )
+
+            # Map output_idx to actual layer_idx
+            # output_idx=0 -> layer_idx=moe_layers[2]
+            # output_idx=1 -> layer_idx=moe_layers[3], etc.
+            layer_idx = self.moe_layers[output_idx + 2]
+            self.cached_predictions[layer_idx] = predicted_experts
+
+    def _predict_experts_for_layer(self, layer_idx, token_pos):
+        """
+        Predict which experts will be needed for this layer using learned predictor.
+        Returns cached predictions that were eagerly computed in the attention hook.
+        Synchronizes with async predictor if needed.
+
+        Args:
+            layer_idx: MoE layer index (2-23 for Qwen)
+            token_pos: Token position (for decode phase)
+
+        Returns:
+            List of expert indices to prefetch
+        """
+        # Check if this layer is one we predict for (layers 2-23)
+        if layer_idx not in self.moe_layers[2:]:
+            return []
+
+        # CRITICAL: Synchronize with predictor stream if predictions are still computing
+        # This ensures we wait for the async predictor to finish before using results
+        if self.predictor_ready_event is not None:
+            self.predictor_ready_event.synchronize()
+            # Clear event after synchronization (only wait once per forward pass)
+            self.predictor_ready_event = None
+
+        # Return cached prediction (computed eagerly in attention hook)
+        # Predictions are now guaranteed to be available since we synchronized
+        return self.cached_predictions.get(layer_idx, [])
 
     def _aggregate_batch_predictions(self, layer_logits, k):
         """
@@ -281,8 +336,10 @@ class FiddlerQwenWithLearnedPrefetch(FiddlerQwenWithPrefetch):
 
     def generate(self, text=None, output_token=20, input_token=None):
         """Generate with learned prefetching and metrics tracking."""
-        # Reset attention output at start of generation
+        # Reset attention output and cached predictions at start of generation
         self.current_attention_output = None
+        self.cached_predictions = {}
+        self.predictor_ready_event = None  # Reset event for new generation
 
         # Call parent generate which handles all the generation logic
         return super().generate(text=text, output_token=output_token, input_token=input_token)
