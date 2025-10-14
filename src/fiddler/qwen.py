@@ -416,12 +416,34 @@ class FiddlerQwen:
         return self.expert_buffer
 
     def generate(self, text=None, output_token=20, input_token=None):
-        """Generate text with expert management tracking."""
-        # Handle text input
+        """
+        Generate text with expert management tracking.
+
+        Args:
+            text: Input text. Can be:
+                  - Single string: "The capital of France is"
+                  - List of strings: ["The capital of France is", "The theory of relativity"]
+                  - None: Use default text
+            output_token: Number of tokens to generate
+            input_token: Limit on input token count
+
+        Returns:
+            Tuple of (prefill_time, decode_time, prefill_hit_rate, decode_hit_rate)
+        """
+        # Handle text input - support both single and batched inputs
         if text is None:
             text = "The capital of France is"
 
-        inputs = self.tokenizer(text, return_tensors="pt")
+        # Tokenize input - handle both single strings and lists of strings
+        if isinstance(text, str):
+            # Single input - use existing behavior
+            inputs = self.tokenizer(text, return_tensors="pt")
+        elif isinstance(text, list):
+            # Batched input - tokenize all together with padding
+            inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+        else:
+            raise ValueError(f"text must be a string or list of strings, got {type(text)}")
+
         input_ids = inputs.input_ids.to(self.device)  # Move to GPU since model is now on GPU
         attention_mask = inputs.attention_mask.to(self.device) if inputs.attention_mask is not None else None
 
