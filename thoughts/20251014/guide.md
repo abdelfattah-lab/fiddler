@@ -8,7 +8,7 @@ Don't stop till you achieve the goal in a reliable way without shortcuts or work
 
 ## Current Goal
 
-Ready for next optimization or benchmarking task.
+Modify the benchmarking script benchmark_prediction_methods.py so that it outputs the accuracy of the prediction of the learned prefetch predictor during prefill and decode phases separately. The accuracy should be calculated according to how many of the experts that were fetched were actually used during the prefill and decode phases respectively. The results should be plotted in separate plots for prefill and decode accuracy, and also included in the analysis report. The script should also check the correctness of the output. Run the script after you modify it and validate that your edits were correct and achieve the required.
 
 ## Previous Goals
 
