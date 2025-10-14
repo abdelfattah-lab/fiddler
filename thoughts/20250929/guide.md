@@ -8,9 +8,61 @@ Don't stop till you achieve the goal in a reliable way without shortcuts or work
 
 ## Current Goal
 
-Modify the benchmarking of the predictor so that we report and plot the prefill speedup and hitrates separate from the decode speedup and hitrates.
+No active goal - ready for next task.
 
 ## Previous Goals
+
+**Status**: ✅ COMPLETED - Prefill/Decode Separation in Benchmark Reporting
+
+Successfully modified the Phase 5 benchmark script to clearly separate prefill and decode metrics in both plotting and analysis.
+
+### What Was Changed:
+
+**1. Enhanced Plot Layout (`benchmark_prediction_methods.py`):**
+   - Expanded from 3x3 grid (9 plots) to 4x3 grid (12 plots) for better organization
+   - **Row 1 - Overall Metrics**: Total time, tokens/sec, total speedup vs baseline
+   - **Row 2 - Prefill Phase Metrics** (color-coded in brown):
+     - Prefill time vs batch size
+     - Prefill hit rates vs batch size (NEW!)
+     - Prefill speedup vs baseline (NEW!)
+   - **Row 3 - Decode Phase Metrics** (color-coded in green):
+     - Decode time vs batch size
+     - Decode hit rates vs batch size
+     - Decode speedup vs baseline (NEW!)
+   - **Row 4 - Key Comparisons**:
+     - Fiddler vs Fiddler+Learned direct comparison
+     - Speedup ratio bar chart
+     - Peak batch size throughput comparison
+
+**2. Enhanced Analysis Report (`generate_analysis()`):**
+   - **Section 1**: Overall comparison (total time, as before)
+   - **Section 2**: Prefill phase analysis with time, hit rates, and speedup vs baseline
+   - **Section 3**: Decode phase analysis with time, hit rates, and speedup vs baseline
+   - **Section 4**: Hit rate comparison showing prefill vs decode side-by-side
+   - **Section 5**: Comprehensive summary table with all metrics
+
+**3. Benefits:**
+   - Clear visual separation of prefill and decode performance characteristics
+   - Prefill hit rates now visible (were missing before)
+   - Separate speedup plots reveal which phase benefits most from each optimization
+   - Color-coded sections make it easy to distinguish prefill (brown) vs decode (green)
+   - Analysis report now has 5 structured sections instead of 2
+
+**4. Validation:**
+   - ✅ Syntax check passed
+   - ✅ Structure validation confirmed 12 subplots present
+   - ✅ All required sections present in plotting and analysis
+   - ✅ Backward compatible with existing data format
+
+### Files Modified:
+1. `benchmark_prediction_methods.py` - Updated `plot_results()` and `generate_analysis()` functions
+2. `test_benchmark_plotting.py` - Created validation test script (NEW)
+
+### Next Steps:
+The benchmark script is ready to be run. Future benchmark results will automatically include the enhanced prefill/decode separation:
+```bash
+python3 benchmark_prediction_methods.py
+```
 
 
 **Status**: ✅ FIXED - Batched Generation Support Implemented Successfully
