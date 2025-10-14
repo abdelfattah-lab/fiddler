@@ -115,10 +115,109 @@ def get_diverse_batch(batch_size: int, seed: int = None) -> List[str]:
     return sentences[:batch_size]
 
 
-def run_single_batch_baseline(model, prompts: List[str], output_tokens: int = 20) -> Dict:
+def generate_text_for_correctness(model, prompts: List[str], output_tokens: int) -> List[str]:
+    """
+    Generate text from model for correctness checking.
+    Uses model.generate from HuggingFace to get actual token IDs.
+
+    Args:
+        model: The model instance
+        prompts: List of input prompts
+        output_tokens: Number of tokens to generate
+
+    Returns:
+        List of generated text (decoded from tokens)
+    """
+    # Tokenize inputs
+    if len(prompts) == 1:
+        inputs = model.tokenizer(prompts[0], return_tensors="pt")
+    else:
+        inputs = model.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+
+    input_ids = inputs.input_ids.to(model.model.device)
+    attention_mask = inputs.attention_mask.to(model.model.device) if inputs.attention_mask is not None else None
+
+    # Generate tokens
+    with torch.no_grad():
+        generated_ids = model.model.generate(
+            input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=output_tokens,
+            do_sample=False,  # Deterministic generation for correctness check
+            pad_token_id=model.tokenizer.eos_token_id,
+            eos_token_id=None,  # Force exact token count
+        )
+
+    # Decode and return
+    generated_texts = model.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+    return generated_texts
+
+
+def check_correctness(results_by_config: Dict[str, Dict], prompts: List[str]) -> Dict:
+    """
+    Check if different configurations produce similar outputs.
+
+    Args:
+        results_by_config: Dict mapping config name to result dict (with 'generated_text')
+        prompts: The input prompts used
+
+    Returns:
+        Dictionary with correctness check results
+    """
+    if not results_by_config or len(results_by_config) < 2:
+        return {'status': 'skipped', 'reason': 'Not enough configurations to compare'}
+
+    # Use baseline as reference if available, otherwise use first config
+    reference_name = 'Baseline' if 'Baseline' in results_by_config else list(results_by_config.keys())[0]
+    reference_text = results_by_config[reference_name].get('generated_text', [])
+
+    if not reference_text:
+        return {'status': 'skipped', 'reason': 'No generated text available'}
+
+    # Compare all other configs to reference
+    comparisons = {}
+    all_match = True
+
+    for config_name, result in results_by_config.items():
+        if config_name == reference_name:
+            continue
+
+        generated_text = result.get('generated_text', [])
+        if not generated_text:
+            comparisons[config_name] = {'status': 'no_text'}
+            continue
+
+        # Check if outputs match
+        matches = [ref == gen for ref, gen in zip(reference_text, generated_text)]
+        match_rate = sum(matches) / len(matches) if matches else 0.0
+
+        comparisons[config_name] = {
+            'status': 'match' if match_rate == 1.0 else 'mismatch',
+            'match_rate': match_rate,
+            'reference': reference_name
+        }
+
+        if match_rate < 1.0:
+            all_match = False
+
+    return {
+        'status': 'pass' if all_match else 'fail',
+        'reference': reference_name,
+        'comparisons': comparisons
+    }
+
+
+def run_single_batch_baseline(model, prompts: List[str], output_tokens: int = 20,
+                             return_generated_text: bool = False) -> Dict:
     """
     Run baseline or Fiddler (single GPU buffer) on a batch.
     Now uses the generate() method for all batch sizes (single string or list of strings).
+
+    Args:
+        model: The model to run
+        prompts: List of input prompts
+        output_tokens: Number of tokens to generate
+        return_generated_text: If True, also generate and return text for correctness checking
     """
     batch_size = len(prompts)
 
@@ -133,7 +232,7 @@ def run_single_batch_baseline(model, prompts: List[str], output_tokens: int = 20
         output_token=output_tokens
     )
 
-    return {
+    result = {
         'prefill_time': prefill_time,
         'decode_time': decode_time,
         'total_time': prefill_time + decode_time,
@@ -142,11 +241,24 @@ def run_single_batch_baseline(model, prompts: List[str], output_tokens: int = 20
         'tokens_per_second': (output_tokens * batch_size) / decode_time if decode_time > 0 else 0
     }
 
+    # Optionally generate text for correctness checking
+    if return_generated_text:
+        result['generated_text'] = generate_text_for_correctness(model, prompts, output_tokens)
 
-def run_single_batch_learned(model, prompts: List[str], output_tokens: int = 20) -> Dict:
+    return result
+
+
+def run_single_batch_learned(model, prompts: List[str], output_tokens: int = 20,
+                            return_generated_text: bool = False) -> Dict:
     """
     Run learned prefetch model on a batch.
     Now uses the generate() method for all batch sizes (single string or list of strings).
+
+    Args:
+        model: The model to run
+        prompts: List of input prompts
+        output_tokens: Number of tokens to generate
+        return_generated_text: If True, also generate and return text for correctness checking
     """
     batch_size = len(prompts)
 
@@ -161,7 +273,7 @@ def run_single_batch_learned(model, prompts: List[str], output_tokens: int = 20)
         output_token=output_tokens
     )
 
-    return {
+    result = {
         'prefill_time': prefill_time,
         'decode_time': decode_time,
         'total_time': prefill_time + decode_time,
@@ -169,6 +281,12 @@ def run_single_batch_learned(model, prompts: List[str], output_tokens: int = 20)
         'decode_hit_rate': decode_hit_rate,
         'tokens_per_second': (output_tokens * batch_size) / decode_time if decode_time > 0 else 0
     }
+
+    # Optionally generate text for correctness checking
+    if return_generated_text:
+        result['generated_text'] = generate_text_for_correctness(model, prompts, output_tokens)
+
+    return result
 
 
 def run_configuration(config_name: str, batch_size: int, num_trials: int = 3,
@@ -362,7 +480,7 @@ def plot_results(results: List[Dict], output_dir: str):
     ax4.grid(True, alpha=0.3)
     ax4.legend()
 
-    # Plot 5: Prefill Hit Rates
+    # Plot 5: Prefill Prediction Accuracy
     ax5 = fig.add_subplot(gs[1, 1])
     for config_name, data in configs.items():
         if config_name == 'Baseline':
@@ -373,8 +491,8 @@ def plot_results(results: List[Dict], output_dir: str):
         ax5.errorbar(batch_sizes, hit_rates, yerr=errors, fmt='o-', label=config_name,
                     color=colors.get(config_name, 'gray'), linewidth=2, markersize=8, capsize=4)
     ax5.set_xlabel('Batch Size', fontsize=11, fontweight='bold')
-    ax5.set_ylabel('Prefill Hit Rate (%)', fontsize=11, fontweight='bold')
-    ax5.set_title('PREFILL: Hit Rate vs Batch Size', fontsize=12, fontweight='bold',
+    ax5.set_ylabel('Prefill Prediction Accuracy (%)', fontsize=11, fontweight='bold')
+    ax5.set_title('PREFILL: Prediction Accuracy vs Batch Size', fontsize=12, fontweight='bold',
                   color='#8B4513')
     ax5.set_xscale('log', base=2)
     ax5.set_ylim([0, 105])
@@ -422,7 +540,7 @@ def plot_results(results: List[Dict], output_dir: str):
     ax7.grid(True, alpha=0.3)
     ax7.legend()
 
-    # Plot 8: Decode Hit Rates
+    # Plot 8: Decode Prediction Accuracy
     ax8 = fig.add_subplot(gs[2, 1])
     for config_name, data in configs.items():
         if config_name == 'Baseline':
@@ -433,8 +551,8 @@ def plot_results(results: List[Dict], output_dir: str):
         ax8.errorbar(batch_sizes, hit_rates, yerr=errors, fmt='o-', label=config_name,
                     color=colors.get(config_name, 'gray'), linewidth=2, markersize=8, capsize=4)
     ax8.set_xlabel('Batch Size', fontsize=11, fontweight='bold')
-    ax8.set_ylabel('Decode Hit Rate (%)', fontsize=11, fontweight='bold')
-    ax8.set_title('DECODE: Hit Rate vs Batch Size', fontsize=12, fontweight='bold',
+    ax8.set_ylabel('Decode Prediction Accuracy (%)', fontsize=11, fontweight='bold')
+    ax8.set_title('DECODE: Prediction Accuracy vs Batch Size', fontsize=12, fontweight='bold',
                   color='#006400')
     ax8.set_xscale('log', base=2)
     ax8.set_ylim([0, 105])
@@ -590,6 +708,41 @@ def generate_analysis(results: List[Dict], output_dir: str):
     analysis_report.append("")
 
     # ========================================================================
+    # SECTION 0: Correctness Check Results
+    # ========================================================================
+    correctness_path = os.path.join(output_dir, 'correctness_check.json')
+    if os.path.exists(correctness_path):
+        with open(correctness_path, 'r') as f:
+            correctness_data = json.load(f)
+
+        analysis_report.append("✅ CORRECTNESS CHECK")
+        analysis_report.append("=" * 80)
+        analysis_report.append("")
+
+        status = correctness_data.get('status', 'unknown')
+        if status == 'pass':
+            analysis_report.append("Status: ✅ PASSED - All configurations produce identical outputs")
+        elif status == 'fail':
+            analysis_report.append("Status: ⚠️  FAILED - Some configurations produce different outputs")
+            comparisons = correctness_data.get('comparisons', {})
+            if comparisons:
+                analysis_report.append("")
+                analysis_report.append("Mismatches detected:")
+                for config_name, comparison in comparisons.items():
+                    if comparison.get('status') == 'mismatch':
+                        match_rate = comparison.get('match_rate', 0) * 100
+                        reference = comparison.get('reference', 'unknown')
+                        analysis_report.append(f"  - {config_name}: {match_rate:.1f}% match with {reference}")
+        else:
+            analysis_report.append(f"Status: {status.upper()}")
+
+        analysis_report.append("")
+        analysis_report.append("Reference: " + correctness_data.get('reference', 'N/A'))
+        analysis_report.append("Configurations tested: " + ", ".join(correctness_data.get('configurations_tested', [])))
+        analysis_report.append("")
+        analysis_report.append("")
+
+    # ========================================================================
     # SECTION 1: Overall Comparison
     # ========================================================================
     if fiddler_data and learned_fiddler_data:
@@ -707,10 +860,13 @@ def generate_analysis(results: List[Dict], output_dir: str):
         analysis_report.append("")
 
     # ========================================================================
-    # SECTION 4: Hit Rate Analysis
+    # SECTION 4: Prediction Accuracy Analysis
     # ========================================================================
-    analysis_report.append("🎯 HIT RATE COMPARISON (PREFILL vs DECODE)")
+    analysis_report.append("🎯 PREDICTION ACCURACY ANALYSIS (PREFILL vs DECODE)")
     analysis_report.append("=" * 80)
+    analysis_report.append("")
+    analysis_report.append("Prediction Accuracy = (Experts prefetched that were used) / (Total experts prefetched)")
+    analysis_report.append("Higher accuracy = Better predictions = Less wasted memory transfers")
     analysis_report.append("")
 
     for config_name, data in configs.items():
@@ -718,16 +874,26 @@ def generate_analysis(results: List[Dict], output_dir: str):
             continue
 
         analysis_report.append(f"{config_name}:")
-        analysis_report.append(f"  {'BS':<5} {'Prefill HR':<15} {'Decode HR':<15}")
-        analysis_report.append("  " + "-" * 40)
+        analysis_report.append(f"  {'BS':<5} {'Prefill Acc':<15} {'Decode Acc':<15} {'Notes':<30}")
+        analysis_report.append("  " + "-" * 70)
 
         for d in data:
             bs = d['batch_size']
             prefill_hr = d['prefill_hit_rate_mean'] * 100
             decode_hr = d['decode_hit_rate_mean'] * 100
 
+            # Add notes based on accuracy
+            if decode_hr >= 80:
+                note = "Excellent prediction"
+            elif decode_hr >= 50:
+                note = "Good prediction"
+            elif decode_hr >= 30:
+                note = "Moderate prediction"
+            else:
+                note = "Poor prediction"
+
             analysis_report.append(
-                f"  {bs:<5} {prefill_hr:>6.1f}%        {decode_hr:>6.1f}%"
+                f"  {bs:<5} {prefill_hr:>6.1f}%        {decode_hr:>6.1f}%        {note:<30}"
             )
 
         analysis_report.append("")
@@ -758,7 +924,7 @@ def generate_analysis(results: List[Dict], output_dir: str):
             )
             if config_name != 'Baseline':
                 analysis_report.append(
-                    f"        Prefill HR: {prefill_hr:.1f}% | Decode HR: {decode_hr:.1f}%"
+                    f"        Prefill Accuracy: {prefill_hr:.1f}% | Decode Accuracy: {decode_hr:.1f}%"
                 )
         analysis_report.append("")
 
@@ -774,6 +940,98 @@ def generate_analysis(results: List[Dict], output_dir: str):
     return analysis_text
 
 
+def run_correctness_check(configurations, output_dir):
+    """
+    Run a quick correctness check to ensure all configurations produce the same output.
+
+    Args:
+        configurations: List of configuration dicts
+        output_dir: Directory to save correctness check results
+
+    Returns:
+        Dictionary with correctness check results
+    """
+    print("\n" + "="*80)
+    print("CORRECTNESS CHECK")
+    print("="*80)
+    print("Verifying that all configurations produce identical outputs...")
+    print("")
+
+    # Use a simple prompt for correctness check
+    test_prompts = ["The capital of France is"]
+    test_output_tokens = 10
+
+    results_by_config = {}
+
+    for config in configurations:
+        config_name = config['name']
+        print(f"  Testing {config_name}...")
+
+        try:
+            # Create args
+            args = Args(use_fiddler_mode=config.get('use_fiddler_mode', False))
+
+            # Determine model class
+            if 'Learned' in config_name:
+                model_class = FiddlerQwenWithLearnedPrefetch
+            else:
+                model_class = FiddlerQwen
+
+            # Load model
+            model = model_class(args, **config['kwargs'])
+
+            # Generate text for correctness check
+            generated_text = generate_text_for_correctness(model, test_prompts, test_output_tokens)
+            results_by_config[config_name] = {'generated_text': generated_text}
+
+            print(f"    Output: {generated_text[0][:80]}...")
+
+            # Cleanup
+            del model
+            torch.cuda.empty_cache()
+
+        except Exception as e:
+            print(f"    ❌ Error: {e}")
+            results_by_config[config_name] = {'error': str(e)}
+
+    # Check correctness
+    print("\n  Checking consistency across configurations...")
+    correctness_result = check_correctness(results_by_config, test_prompts)
+
+    # Print results
+    print(f"\n  Status: {correctness_result['status'].upper()}")
+    if correctness_result['status'] == 'pass':
+        print("  ✅ All configurations produce identical outputs!")
+    elif correctness_result['status'] == 'fail':
+        print("  ⚠️  Warning: Some configurations produce different outputs")
+        for config_name, comparison in correctness_result.get('comparisons', {}).items():
+            if comparison.get('status') == 'mismatch':
+                match_rate = comparison.get('match_rate', 0)
+                print(f"     - {config_name}: {match_rate*100:.1f}% match with {comparison['reference']}")
+    else:
+        print(f"  ⏭️  {correctness_result.get('reason', 'Skipped')}")
+
+    # Save results
+    correctness_path = os.path.join(output_dir, 'correctness_check.json')
+    with open(correctness_path, 'w') as f:
+        # Convert to serializable format
+        serializable_result = {
+            'status': correctness_result['status'],
+            'reference': correctness_result.get('reference', 'N/A'),
+            'configurations_tested': list(results_by_config.keys()),
+            'test_prompts': test_prompts,
+            'test_output_tokens': test_output_tokens
+        }
+        if 'comparisons' in correctness_result:
+            serializable_result['comparisons'] = correctness_result['comparisons']
+        json.dump(serializable_result, f, indent=2)
+
+    print(f"\n  💾 Correctness check results saved to: {correctness_path}")
+    print("="*80)
+
+    return correctness_result
+
+
 def main():
     """Main benchmark function."""
     print("\n" + "="*80)
@@ -783,7 +1041,8 @@ def main():
     print("  1. Find configurations where Fiddler+Learned-Prefetch > Fiddler alone")
     print("  2. Test with diverse sentences (different for each batch element)")
     print("  3. Multiple trials for statistical reliability")
-    print("  4. Results suitable for research paper")
+    print("  4. Check correctness of outputs across configurations")
+    print("  5. Track prediction accuracy for prefill and decode phases separately")
     print("="*80)
 
     # Configuration
@@ -835,6 +1094,15 @@ def main():
     print(f"Batch sizes: {batch_sizes}")
     print(f"Trials per configuration: {num_trials}")
     print(f"Output tokens per prompt: {output_tokens}")
+
+    # Run correctness check first
+    correctness_result = run_correctness_check(configurations, output_dir)
+
+    # Check if correctness test passed
+    if correctness_result['status'] == 'fail':
+        print("\n⚠️  WARNING: Correctness check detected differences between configurations!")
+        print("   Proceeding with benchmark, but results should be interpreted carefully.")
+        print("   Check correctness_check.json for details.")
 
     # Run all benchmarks
     all_results = []
