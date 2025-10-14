@@ -683,6 +683,7 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
 
     def _calculate_expert_costs(self, expert_token_counts, layer_idx):
         """
+        # TODO: The way of calculating costs should match what is implemented in src/fiddler/mixtral.py
         Calculate CPU and GPU costs for each expert based on token counts.
 
         Args:
@@ -699,18 +700,20 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         cost_per_expert = {}
 
         for expert_idx, num_tokens in expert_token_counts.items():
-            # CPU cost: Fiddler's model (execution only, outputs accumulate directly)
-            cpu_cost = num_tokens * latency_cpu
+            if num_tokens <= 0:
+                # Skip experts without work so greedy partitioning ignores them.
+                continue
 
-            # GPU cost depends on whether expert needs to be transferred
+            # CPU cost grows linearly with the number of tokens assigned to the expert.
+            cpu_cost = float(num_tokens) * latency_cpu
+
+            # GPU cost mirrors the Mixtral implementation:
+            # * Default case: expert must be transferred, so cost is the transfer latency.
+            # * Resident/prefetched experts already live on the GPU, so cost is effectively 0.
             if layer_idx in self.gpu_resident_layers or self._is_expert_prefetched(layer_idx, expert_idx):
-                # Expert is on GPU (resident or prefetched)
-                # GPU execution is faster than CPU (no transfer needed)
-                # Use lower cost to prefer GPU for prefetched experts
-                gpu_cost = 0.7 * num_tokens * latency_cpu  # GPU 30% faster than CPU for execution
+                gpu_cost = 0.0
             else:
-                # Expert needs to be transferred from CPU to GPU
-                gpu_cost = latency_gpu  # Transfer dominates for on-demand loading
+                gpu_cost = latency_gpu
 
             cost_per_expert[expert_idx] = (cpu_cost, gpu_cost)
 
