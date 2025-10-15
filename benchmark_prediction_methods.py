@@ -942,14 +942,16 @@ def generate_analysis(results: List[Dict], output_dir: str):
 
 def run_correctness_check(configurations, output_dir):
     """
-    Run a quick correctness check to ensure all configurations produce the same output.
+    Run quick correctness checks to ensure all configurations produce the same output.
+    We validate both single-prompt (batch size 1) and multi-prompt batches to
+    confirm that batched generation paths stay aligned across configurations.
 
     Args:
         configurations: List of configuration dicts
         output_dir: Directory to save correctness check results
 
     Returns:
-        Dictionary with correctness check results
+        Dictionary with aggregated correctness outcomes across all scenarios
     """
     print("\n" + "="*80)
     print("CORRECTNESS CHECK")
@@ -957,79 +959,112 @@ def run_correctness_check(configurations, output_dir):
     print("Verifying that all configurations produce identical outputs...")
     print("")
 
-    # Use a simple prompt for correctness check
-    test_prompts = ["The capital of France is"]
-    test_output_tokens = 10
+    # Scenario definitions keep prompts intentionally short so we can eyeball the outputs.
+    scenarios = [
+        {
+            'name': 'single_prompt',
+            'description': 'Single prompt (batch size = 1)',
+            'prompts': ["The capital of France is"],
+            'output_tokens': 10
+        },
+        {
+            'name': 'batched_prompts',
+            'description': 'Diverse prompts (batch size = 4)',
+            'prompts': get_diverse_batch(4, seed=1234),
+            'output_tokens': 10
+        }
+    ]
 
-    results_by_config = {}
+    scenario_results = {}
+    scenario_statuses = []
 
-    for config in configurations:
-        config_name = config['name']
-        print(f"  Testing {config_name}...")
+    for scenario in scenarios:
+        print("-" * 80)
+        print(f"Scenario: {scenario['description']}")
+        print(f"  Batch size: {len(scenario['prompts'])} | Output tokens: {scenario['output_tokens']}")
+        results_by_config = {}
 
-        try:
-            # Create args
-            args = Args(use_fiddler_mode=config.get('use_fiddler_mode', False))
+        for config in configurations:
+            config_name = config['name']
+            print(f"  Testing {config_name}...")
 
-            # Determine model class
-            if 'Learned' in config_name:
-                model_class = FiddlerQwenWithLearnedPrefetch
-            else:
-                model_class = FiddlerQwen
+            model = None
+            try:
+                args = Args(use_fiddler_mode=config.get('use_fiddler_mode', False))
 
-            # Load model
-            model = model_class(args, **config['kwargs'])
+                if 'Learned' in config_name:
+                    model_class = FiddlerQwenWithLearnedPrefetch
+                else:
+                    model_class = FiddlerQwen
 
-            # Generate text for correctness check
-            generated_text = generate_text_for_correctness(model, test_prompts, test_output_tokens)
-            results_by_config[config_name] = {'generated_text': generated_text}
+                model = model_class(args, **config['kwargs'])
 
-            print(f"    Output: {generated_text[0][:80]}...")
+                generated_text = generate_text_for_correctness(
+                    model,
+                    scenario['prompts'],
+                    scenario['output_tokens']
+                )
+                results_by_config[config_name] = {'generated_text': generated_text}
 
-            # Cleanup
-            del model
-            torch.cuda.empty_cache()
+                preview = " | ".join(text[:60] for text in generated_text[:2])
+                print(f"    Output preview: {preview}...")
 
-        except Exception as e:
-            print(f"    ❌ Error: {e}")
-            results_by_config[config_name] = {'error': str(e)}
+            except Exception as e:
+                print(f"    ❌ Error: {e}")
+                results_by_config[config_name] = {'error': str(e)}
+            finally:
+                if model is not None:
+                    del model
+                torch.cuda.empty_cache()
 
-    # Check correctness
-    print("\n  Checking consistency across configurations...")
-    correctness_result = check_correctness(results_by_config, test_prompts)
+        print("\n  Checking consistency across configurations...")
+        correctness_result = check_correctness(results_by_config, scenario['prompts'])
 
-    # Print results
-    print(f"\n  Status: {correctness_result['status'].upper()}")
-    if correctness_result['status'] == 'pass':
-        print("  ✅ All configurations produce identical outputs!")
-    elif correctness_result['status'] == 'fail':
-        print("  ⚠️  Warning: Some configurations produce different outputs")
-        for config_name, comparison in correctness_result.get('comparisons', {}).items():
-            if comparison.get('status') == 'mismatch':
-                match_rate = comparison.get('match_rate', 0)
-                print(f"     - {config_name}: {match_rate*100:.1f}% match with {comparison['reference']}")
-    else:
-        print(f"  ⏭️  {correctness_result.get('reason', 'Skipped')}")
-
-    # Save results
-    correctness_path = os.path.join(output_dir, 'correctness_check.json')
-    with open(correctness_path, 'w') as f:
-        # Convert to serializable format
-        serializable_result = {
+        scenario_statuses.append(correctness_result['status'])
+        scenario_results[scenario['name']] = {
             'status': correctness_result['status'],
             'reference': correctness_result.get('reference', 'N/A'),
             'configurations_tested': list(results_by_config.keys()),
-            'test_prompts': test_prompts,
-            'test_output_tokens': test_output_tokens
+            'test_prompts': scenario['prompts'],
+            'test_output_tokens': scenario['output_tokens']
         }
         if 'comparisons' in correctness_result:
-            serializable_result['comparisons'] = correctness_result['comparisons']
+            scenario_results[scenario['name']]['comparisons'] = correctness_result['comparisons']
+
+        print(f"\n  Status: {correctness_result['status'].upper()}")
+        if correctness_result['status'] == 'pass':
+            print("  ✅ All configurations produce identical outputs!")
+        elif correctness_result['status'] == 'fail':
+            print("  ⚠️  Warning: Some configurations produce different outputs")
+            for config_name, comparison in correctness_result.get('comparisons', {}).items():
+                if comparison.get('status') == 'mismatch':
+                    match_rate = comparison.get('match_rate', 0)
+                    print(f"     - {config_name}: {match_rate*100:.1f}% match with {comparison['reference']}")
+        else:
+            print(f"  ⏭️  {correctness_result.get('reason', 'Skipped')}")
+
+    correctness_path = os.path.join(output_dir, 'correctness_check.json')
+    if any(status == 'fail' for status in scenario_statuses):
+        overall_status = 'fail'
+    elif any(status == 'pass' for status in scenario_statuses):
+        overall_status = 'pass'
+    else:
+        overall_status = scenario_statuses[0] if scenario_statuses else 'skipped'
+
+    with open(correctness_path, 'w') as f:
+        serializable_result = {
+            'status': overall_status,
+            'scenarios': scenario_results
+        }
         json.dump(serializable_result, f, indent=2)
 
     print(f"\n  💾 Correctness check results saved to: {correctness_path}")
     print("="*80)
 
-    return correctness_result
+    return {
+        'status': overall_status,
+        'scenarios': scenario_results
+    }
 
 
 def main():

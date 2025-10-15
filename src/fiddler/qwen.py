@@ -32,6 +32,12 @@ class FiddlerQwen:
         self.use_fiddler_mode = getattr(args, 'use_fiddler_mode', False)
         self.fiddler_batch_threshold = getattr(args, 'fiddler_batch_threshold', 8)  # Default: use CPU for batch < 8
 
+        # Cost model parameters (mirrors Mixtral implementation behaviour)
+        latency_cpu = getattr(args, 'latency_cpu', None)
+        latency_gpu = getattr(args, 'latency_gpu', None)
+        self.latency_cpu = float(latency_cpu) if latency_cpu is not None else 0.05  # ms per token on CPU
+        self.latency_gpu = float(latency_gpu) if latency_gpu is not None else 5.0   # ms constant transfer cost
+
         print(f"🚀 Loading {self.model_name} with Fiddler expert management")
 
         # Load model with correct device placement
@@ -196,17 +202,6 @@ class FiddlerQwen:
         # Determine if we're in prefill (sequence_length > 1) or decode (sequence_length == 1) phase
         is_prefill = sequence_length > 1
 
-        # Fiddler mode: execute on CPU for small batches
-        if self.use_fiddler_mode and batch_size < self.fiddler_batch_threshold:
-            result = self._moe_forward_cpu(hidden_states, layer_idx, moe_layer, batch_size, sequence_length, hidden_dim)
-            # Track timing
-            layer_time = time.time() - layer_start_time
-            if is_prefill:
-                self.prefill_time += layer_time
-            else:
-                self.decode_time += layer_time
-            return result
-
         hidden_states_flat = hidden_states.view(-1, hidden_dim)
 
         # Router computation (this stays on CPU since gate is on CPU)
@@ -235,44 +230,82 @@ class FiddlerQwen:
         # Find active experts
         expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
 
-        # Process each active expert
-        for i, expert_idx_tensor in enumerate(expert_hit):
+        # Gather expert data for potential CPU/GPU partitioning
+        expert_data = {}
+        expert_token_counts = {}
+
+        for expert_idx_tensor in expert_hit:
             expert_idx = expert_idx_tensor.item()
 
-            # Find tokens assigned to this expert
             idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
 
             if len(top_x) == 0:
                 continue
 
-            # Get input for this expert
             current_state = hidden_states_flat[None, top_x].reshape(-1, hidden_dim)
-
-            # Get routing weights for this expert
             expert_routing_weights = routing_weights[top_x, idx, None]
 
-            # Load expert to GPU buffer and execute
+            expert_data[expert_idx] = {
+                'idx': idx,
+                'top_x': top_x,
+                'input': current_state,
+                'weights': expert_routing_weights
+            }
+            expert_token_counts[expert_idx] = top_x.shape[0]
+
+        cpu_expert_list = []
+        gpu_expert_list = list(expert_data.keys())
+
+        # Use cost model to decide CPU/GPU assignment when Fiddler mode is enabled
+        if expert_data and self.use_fiddler_mode and batch_size < self.fiddler_batch_threshold:
+            cost_per_expert = self._calculate_expert_costs(expert_token_counts)
+            if cost_per_expert:
+                cpu_expert_list, gpu_expert_list = self._partition_experts_greedy(cost_per_expert)
+                # Ensure GPU list includes any experts not present in the cost map (safety guard)
+                gpu_expert_list = [idx for idx in expert_data.keys() if idx not in cpu_expert_list]
+
+        # Execute experts assigned to CPU
+        for expert_idx in cpu_expert_list:
+            data = expert_data[expert_idx]
+            top_x = data['top_x']
+
+            cpu_output = self._run_expert_on_cpu(
+                layer_idx,
+                expert_idx,
+                data['input'],
+                data['weights']
+            )
+
+            if cpu_output.device != final_hidden_states.device:
+                cpu_output = cpu_output.to(final_hidden_states.device)
+            cpu_output = cpu_output.to(final_hidden_states.dtype)
+            final_hidden_states.index_add_(0, top_x, cpu_output)
+
+            self.cnt_expert_all += len(top_x)
+
+        # Execute experts assigned to GPU (default path)
+        for expert_idx in gpu_expert_list:
+            data = expert_data[expert_idx]
+            top_x = data['top_x']
+
+            current_state = data['input']
+            expert_routing_weights = data['weights']
+
             expert_buffer = self._get_expert_for_execution(layer_idx, expert_idx)
 
-            # Execute expert computation on GPU
             if current_state.device != expert_buffer.gate_proj.weight.device:
                 current_state = current_state.to(expert_buffer.gate_proj.weight.device)
 
             expert_output = expert_buffer(current_state)
-
-            # Apply routing weights
             current_hidden_states = expert_output * expert_routing_weights.to(expert_output.device)
 
-            # Move back to original device if needed and accumulate
             if current_hidden_states.device != final_hidden_states.device:
                 current_hidden_states = current_hidden_states.to(final_hidden_states.device)
 
-            # Ensure dtype consistency before accumulation
             current_hidden_states = current_hidden_states.to(final_hidden_states.dtype)
 
             final_hidden_states.index_add_(0, top_x, current_hidden_states)
 
-            # Update statistics
             self.cnt_expert_all += len(top_x)
             if self.current_expert == (layer_idx, expert_idx):
                 self.cnt_expert_hit += len(top_x)
@@ -378,6 +411,72 @@ class FiddlerQwen:
             router_logits = router_logits.to(original_device)
 
         return final_hidden_states, router_logits
+
+    def _calculate_expert_costs(self, expert_token_counts):
+        """Compute CPU and GPU cost estimates for each expert."""
+        latency_cpu = self.latency_cpu if self.latency_cpu is not None else 0.05
+        latency_gpu = self.latency_gpu if self.latency_gpu is not None else 5.0
+
+        cost_per_expert = {}
+        for expert_idx, num_tokens in expert_token_counts.items():
+            if num_tokens <= 0:
+                continue
+
+            cpu_cost = float(num_tokens) * latency_cpu
+            gpu_cost = latency_gpu
+            cost_per_expert[expert_idx] = (cpu_cost, gpu_cost)
+
+        return cost_per_expert
+
+    def _partition_experts_greedy(self, cost_per_expert):
+        """Greedy partitioning that mirrors the Mixtral implementation."""
+        if not cost_per_expert:
+            return [], []
+
+        benefits = []
+        for expert_idx, (cpu_cost, gpu_cost) in cost_per_expert.items():
+            benefit = gpu_cost - cpu_cost
+            benefits.append((benefit, expert_idx, cpu_cost, gpu_cost))
+
+        benefits.sort(reverse=True)
+
+        cpu_experts = []
+        gpu_experts = list(cost_per_expert.keys())
+
+        cpu_cost_total = 0.0
+        gpu_cost_total = sum(cost_per_expert[idx][1] for idx in gpu_experts)
+        current_bottleneck = max(cpu_cost_total, gpu_cost_total)
+
+        for benefit, expert_idx, cpu_cost, gpu_cost in benefits:
+            if benefit <= 0:
+                break
+
+            new_cpu_cost = cpu_cost_total + cpu_cost
+            new_gpu_cost = gpu_cost_total - gpu_cost
+            new_bottleneck = max(new_cpu_cost, new_gpu_cost)
+
+            if new_bottleneck < current_bottleneck:
+                cpu_experts.append(expert_idx)
+                gpu_experts.remove(expert_idx)
+                cpu_cost_total = new_cpu_cost
+                gpu_cost_total = new_gpu_cost
+                current_bottleneck = new_bottleneck
+
+        return cpu_experts, gpu_experts
+
+    def _run_expert_on_cpu(self, layer_idx, expert_idx, input_tensor, routing_weights):
+        """Execute a single expert on CPU and return its weighted contribution."""
+        moe_layer = self.model.model.layers[layer_idx].mlp
+        cpu_expert = moe_layer.experts[expert_idx]
+
+        input_cpu = input_tensor.cpu()
+        with torch.no_grad():
+            expert_output_cpu = cpu_expert(input_cpu)
+
+        expert_output_gpu = expert_output_cpu.to(self.device, dtype=self.dtype)
+        weighted_output = expert_output_gpu * routing_weights.to(expert_output_gpu.device)
+
+        return weighted_output
 
     def _get_expert_for_execution(self, layer_idx, expert_idx):
         """Get expert for execution, loading from CPU to GPU buffer if needed."""

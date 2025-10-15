@@ -683,7 +683,6 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
 
     def _calculate_expert_costs(self, expert_token_counts, layer_idx):
         """
-        # TODO: The way of calculating costs should match what is implemented in src/fiddler/mixtral.py
         Calculate CPU and GPU costs for each expert based on token counts.
 
         Args:
