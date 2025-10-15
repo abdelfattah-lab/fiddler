@@ -58,18 +58,25 @@ class ExpertUsageProfiler:
 
 
 class PrefetchMetrics:
-    """Tracks prefetch hit rates and performance metrics."""
+    """Tracks prefetch hit rates and performance metrics.
+
+    Hit rate definition:
+    - Numerator: Number of tokens assigned to GPU experts that were readily available (prefetched or GPU-resident)
+    - Denominator: Total number of tokens assigned to GPU experts
+
+    This gives a cache effectiveness measure weighted by the amount of work done.
+    """
 
     def __init__(self):
-        self.total_expert_requests = 0
-        self.prefetch_hits = 0
-        self.prefetch_misses = 0
+        self.total_tokens = 0  # Total tokens assigned to GPU experts
+        self.prefetch_hit_tokens = 0  # Tokens assigned to readily-available GPU experts
+        self.prefetch_miss_tokens = 0  # Tokens assigned to on-demand-loaded GPU experts
 
-        # Detailed tracking by phase
-        self.prefill_hits = 0
-        self.prefill_misses = 0
-        self.decode_hits = 0
-        self.decode_misses = 0
+        # Detailed tracking by phase (token-weighted)
+        self.prefill_hit_tokens = 0
+        self.prefill_miss_tokens = 0
+        self.decode_hit_tokens = 0
+        self.decode_miss_tokens = 0
 
         # Track current phase
         self.current_phase = "prefill"
@@ -78,42 +85,49 @@ class PrefetchMetrics:
         """Set current phase (prefill or decode)."""
         self.current_phase = phase
 
-    def record_expert_access(self, layer_id, expert_id, was_prefetched):
-        """Record whether an expert access was a hit or miss."""
-        self.total_expert_requests += 1
+    def record_expert_access(self, layer_id, expert_id, was_prefetched, token_count):
+        """Record whether an expert access was a hit or miss, weighted by token count.
+
+        Args:
+            layer_id: Layer index
+            expert_id: Expert index
+            was_prefetched: True if expert was readily available (prefetched or GPU-resident), False if loaded on-demand
+            token_count: Number of tokens assigned to this expert (for weighting)
+        """
+        self.total_tokens += token_count
 
         if was_prefetched:
-            self.prefetch_hits += 1
+            self.prefetch_hit_tokens += token_count
             if self.current_phase == "prefill":
-                self.prefill_hits += 1
+                self.prefill_hit_tokens += token_count
             else:
-                self.decode_hits += 1
+                self.decode_hit_tokens += token_count
         else:
-            self.prefetch_misses += 1
+            self.prefetch_miss_tokens += token_count
             if self.current_phase == "prefill":
-                self.prefill_misses += 1
+                self.prefill_miss_tokens += token_count
             else:
-                self.decode_misses += 1
+                self.decode_miss_tokens += token_count
 
     def get_hit_rate(self):
-        """Get overall prefetch hit rate."""
-        if self.total_expert_requests == 0:
+        """Get overall prefetch hit rate (token-weighted)."""
+        if self.total_tokens == 0:
             return 0.0
-        return self.prefetch_hits / self.total_expert_requests
+        return self.prefetch_hit_tokens / self.total_tokens
 
     def get_prefill_hit_rate(self):
-        """Get prefill-phase prefetch hit rate."""
-        total_prefill = self.prefill_hits + self.prefill_misses
+        """Get prefill-phase prefetch hit rate (token-weighted)."""
+        total_prefill = self.prefill_hit_tokens + self.prefill_miss_tokens
         if total_prefill == 0:
             return 0.0
-        return self.prefill_hits / total_prefill
+        return self.prefill_hit_tokens / total_prefill
 
     def get_decode_hit_rate(self):
-        """Get decode-phase prefetch hit rate."""
-        total_decode = self.decode_hits + self.decode_misses
+        """Get decode-phase prefetch hit rate (token-weighted)."""
+        total_decode = self.decode_hit_tokens + self.decode_miss_tokens
         if total_decode == 0:
             return 0.0
-        return self.decode_hits / total_decode
+        return self.decode_hit_tokens / total_decode
 
 
 class FiddlerQwenWithPrefetch(FiddlerQwen):
@@ -350,7 +364,7 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
 
                 self.cpu_expert_count += 1
                 self.cpu_execution_time += cpu_elapsed
-                self.cnt_expert_all += len(top_x)
+                # Note: CPU experts are NOT counted in cnt_expert_all since hit rate only tracks GPU experts
 
                 # Accumulate results
                 weighted_output = weighted_output.to(final_hidden_states.dtype)
@@ -378,11 +392,11 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
                     expert_buffer = self._get_expert_for_execution_with_prefetch(
                         layer_idx, expert_idx, was_prefetched=True
                     )
-                    self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=True)
+                    self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=True, token_count=len(top_x))
                     self.cnt_expert_hit += len(top_x)
                 else:
                     expert_buffer = self._get_expert_for_execution(layer_idx, expert_idx)
-                    self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=False)
+                    self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=False, token_count=len(top_x))
 
                 self.gpu_expert_count += 1
                 self.cnt_expert_all += len(top_x)
@@ -428,7 +442,7 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
                     expert_buffer = moe_layer.experts[expert_idx]
                     if NVTX_AVAILABLE:
                         nvtx.end_range(range_id)
-                    self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=True)
+                    self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=True, token_count=len(top_x))
                     self.cnt_expert_hit += len(top_x)
                 # Check if expert was prefetched, use prefetched version if available
                 elif self._is_expert_prefetched(layer_idx, expert_idx):
@@ -446,7 +460,7 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
                     expert_buffer = self._get_expert_for_execution_with_prefetch(layer_idx, expert_idx, was_prefetched=True)
                     if NVTX_AVAILABLE:
                         nvtx.end_range(range_id)
-                    self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=True)
+                    self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=True, token_count=len(top_x))
                     self.cnt_expert_hit += len(top_x)
                 else:
                     # Load expert on-demand using the base class method
@@ -455,7 +469,7 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
                     expert_buffer = self._get_expert_for_execution(layer_idx, expert_idx)
                     if NVTX_AVAILABLE:
                         nvtx.end_range(range_id)
-                    self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=False)
+                    self.metrics.record_expert_access(layer_idx, expert_idx, was_prefetched=False, token_count=len(top_x))
 
                 self.cnt_expert_all += len(top_x)
 
@@ -939,18 +953,18 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         return (prefill_time, decode_time, prefill_hit_rate, decode_hit_rate)
 
     def get_prefetch_stats(self):
-        """Get detailed prefetch statistics."""
+        """Get detailed prefetch statistics (token-weighted)."""
         return {
             'overall_hit_rate': self.metrics.get_hit_rate(),
             'prefill_hit_rate': self.metrics.get_prefill_hit_rate(),
             'decode_hit_rate': self.metrics.get_decode_hit_rate(),
-            'total_requests': self.metrics.total_expert_requests,
-            'prefetch_hits': self.metrics.prefetch_hits,
-            'prefetch_misses': self.metrics.prefetch_misses,
-            'prefill_hits': self.metrics.prefill_hits,
-            'prefill_misses': self.metrics.prefill_misses,
-            'decode_hits': self.metrics.decode_hits,
-            'decode_misses': self.metrics.decode_misses
+            'total_tokens': self.metrics.total_tokens,
+            'prefetch_hit_tokens': self.metrics.prefetch_hit_tokens,
+            'prefetch_miss_tokens': self.metrics.prefetch_miss_tokens,
+            'prefill_hit_tokens': self.metrics.prefill_hit_tokens,
+            'prefill_miss_tokens': self.metrics.prefill_miss_tokens,
+            'decode_hit_tokens': self.metrics.decode_hit_tokens,
+            'decode_miss_tokens': self.metrics.decode_miss_tokens
         }
 
     def get_cpu_offload_stats(self):

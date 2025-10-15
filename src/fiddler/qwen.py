@@ -282,7 +282,7 @@ class FiddlerQwen:
             cpu_output = cpu_output.to(final_hidden_states.dtype)
             final_hidden_states.index_add_(0, top_x, cpu_output)
 
-            self.cnt_expert_all += len(top_x)
+            # Note: CPU experts are NOT counted in cnt_expert_all since hit rate only tracks GPU experts
 
         # Execute experts assigned to GPU (default path)
         for expert_idx in gpu_expert_list:

@@ -8,75 +8,81 @@ Don't stop till you achieve the goal in a reliable way without shortcuts or work
 
 ## Current Goal
 
-**Status**: ✅ COMPLETED - Nsight Systems Profiling and Speedup Analysis
-
-Successfully profiled and analyzed the configurations that achieved speedup in learned prefetch over Fiddler-only.
-
-### What Was Done:
-
-**1. Created Profiling Infrastructure:**
-- `profile_fiddler_bs8.py` - Profile Fiddler-only at BS=8
-- `profile_fiddler_learned_bs8.py` - Profile Fiddler+Learned at BS=8
-- `profile_fiddler_bs16.py` - Profile Fiddler-only at BS=16
-- `profile_fiddler_learned_bs16.py` - Profile Fiddler+Learned at BS=16
-- `analyze_speedup_profiles.py` - Statistical analysis script
-
-**2. Generated Nsight Systems Profiles:**
-Located in `speedup_profiles/`:
-- `fiddler_bs8.nsys-rep` (23MB) - Fiddler-only at BS=8
-- `fiddler_learned_bs8.nsys-rep` (33MB) - Fiddler+Learned at BS=8
-- `fiddler_bs16.nsys-rep` (31MB) - Fiddler-only at BS=16
-- `fiddler_learned_bs16.nsys-rep` (48MB) - Fiddler+Learned at BS=16
-
-**3. Key Findings:**
-
-**Batch Size 8:**
-- Fiddler-only: 6.250s (99.6% CPU, 0.4% GPU)
-- Fiddler+Learned: 5.972s (77.7% CPU, 22.3% GPU)
-- **Speedup: 1.047x** (4.4% faster)
-- **Root cause**: 2,483 expert executions moved from CPU to GPU
-
-**Batch Size 16:**
-- Fiddler-only: 9.333s (99.6% CPU, 0.4% GPU)
-- Fiddler+Learned: 8.936s (82.1% CPU, 17.9% GPU)
-- **Speedup: 1.044x** (4.3% faster)
-- **Root cause**: 2,803 expert executions moved from CPU to GPU
-
-**Why Learned Prefetch Wins:**
-1. **Higher prefill hit rates** (92.4% vs 69.9% at BS=8, 83.6% vs 62.1% at BS=16)
-2. **Better expert placement** - Predictor enables shifting experts from CPU to GPU
-3. **Reduced CPU execution time** (15-16% reduction)
-4. **Prefill phase benefits most** (9-12% speedup)
-
-**4. Comprehensive Report:**
-- `speedup_profiles/SPEEDUP_ANALYSIS_REPORT.md` - Complete analysis with:
-  - Detailed performance metrics
-  - Root cause analysis
-  - Technical mechanisms explanation
-  - Recommendations for production deployment
-  - Comparison with benchmark results
-  - Instructions for GUI analysis
-
-### Files Created:
-1. `speedup_profiles/SPEEDUP_ANALYSIS_REPORT.md` - Main report (~450 lines)
-2. `speedup_profiles/*.nsys-rep` - 4 profile files for GUI analysis (135MB total)
-3. `speedup_profiles/*.log` - Console outputs from profiling runs
-4. `profile_*.py` - 4 profiling scripts
-5. `analyze_speedup_profiles.py` - Analysis automation
-
-### How to Analyze with Nsight Systems GUI:
-```bash
-# Open any profile in GUI
-nsight-sys speedup_profiles/fiddler_bs8.nsys-rep
-
-# Or generate CLI statistics
-nsys stats --report nvtx_sum,cuda_api_sum speedup_profiles/fiddler_bs8.nsys-rep
-```
-
-### Next Steps:
-All artifacts ready for further analysis. The .nsys-rep files can be opened in Nsight Systems GUI for detailed visual inspection of CUDA kernels, memory transfers, and CPU/GPU overlap.
+None - all tasks completed!
 
 ## Previous Goals
+
+**Status**: ✅ COMPLETED - Hit Rate Definition Update
+
+Successfully updated the hit rate calculation to match the new definition and ensure proper separation between prefill and decode phases.
+
+### What Was Changed:
+
+**Problem Statement:**
+The hit rate needed to be redefined to only count GPU experts (not CPU experts) and be properly token-weighted:
+- Numerator: Number of tokens assigned to GPU experts that were readily available (prefetched or GPU-resident)
+- Denominator: Total number of tokens assigned to GPU experts
+
+**Solution Implemented:**
+
+**1. Updated `PrefetchMetrics` class (`src/fiddler/qwen_with_prefetch.py` lines 60-130):**
+   - Changed from counting expert accesses to counting tokens
+   - Updated all tracking variables:
+     - `total_tokens` (was `total_expert_requests`)
+     - `prefetch_hit_tokens` (was `prefetch_hits`)
+     - `prefetch_miss_tokens` (was `prefetch_misses`)
+     - `prefill_hit_tokens` / `prefill_miss_tokens` (was `prefill_hits` / `prefill_misses`)
+     - `decode_hit_tokens` / `decode_miss_tokens` (was `decode_hits` / `decode_misses`)
+   - Updated `record_expert_access()` to accept `token_count` parameter
+   - Updated hit rate calculations to use token counts
+
+**2. Removed CPU expert counting from denominator in `qwen_with_prefetch.py`:**
+   - Line 367: Removed `self.cnt_expert_all += len(top_x)` from CPU expert path
+   - Added comment explaining CPU experts are not counted in hit rate
+
+**2b. Removed CPU expert counting from denominator in `qwen.py`:**
+   - Line 285: Removed `self.cnt_expert_all += len(top_x)` from CPU expert path
+   - Added comment explaining CPU experts are not counted in hit rate
+
+**3. Updated all `record_expert_access()` calls:**
+   - Line 395: Added `token_count=len(top_x)` parameter (CPU offload + prefetch path)
+   - Line 399: Added `token_count=len(top_x)` parameter (CPU offload + on-demand path)
+   - Line 445: Added `token_count=len(top_x)` parameter (GPU-resident path)
+   - Line 463: Added `token_count=len(top_x)` parameter (prefetch hit path)
+   - Line 472: Added `token_count=len(top_x)` parameter (on-demand load path)
+
+**4. Updated `get_prefetch_stats()` method:**
+   - Changed to return token-based metrics instead of request-based metrics
+   - Updated all field names to match new token-weighted tracking
+
+**5. Benefits:**
+   - ✅ Hit rate now accurately reflects cache effectiveness for GPU experts only
+   - ✅ Token-weighting gives proper importance to experts processing more tokens
+   - ✅ Separate tracking for prefill and decode phases maintained
+   - ✅ CPU experts correctly excluded from hit rate calculation
+   - ✅ All metrics properly phase-separated (prefill vs decode)
+
+**6. Validation:**
+   - ✅ Correctness test passed (`test_correctness.py`)
+   - ✅ Hit rates reported separately for prefill and decode
+   - ✅ Example output: "Prefill: 41.7%, Decode: 100.0%"
+   - ✅ No changes to model behavior or output correctness
+
+### Files Modified:
+1. `src/fiddler/qwen_with_prefetch.py` - Updated PrefetchMetrics class, removed CPU counting, updated all record_expert_access calls, updated get_prefetch_stats
+2. `src/fiddler/qwen.py` - Removed CPU expert counting from hit rate denominator
+3. `thoughts/20251014/guide.md` - Documented the changes
+
+### Impact:
+The hit rate definition now correctly measures:
+- **What it counts**: Only GPU experts (CPU experts excluded)
+- **How it weights**: By number of tokens (not just by expert access count)
+- **Phase separation**: Separate rates for prefill and decode phases
+
+This provides a more accurate measure of prefetch effectiveness since it:
+1. Doesn't penalize the system for using CPU offloading (CPU experts not in denominator)
+2. Weights by workload (experts processing many tokens count more)
+3. Clearly separates prefill (lower hit rate expected) from decode (higher hit rate expected)
 
 ## Latest Updates (2025-10-14)
 
