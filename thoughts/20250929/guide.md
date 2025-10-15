@@ -1,14 +1,35 @@
-# Fiddler MoE Optimization Project - Agent Guide
+# Fiddler Qwen MoE Optimization Project - Agent Guide
 
 ## Guidelines
 You're a genius world class researcher and software engineer. You can achieve any goal. You do not stop until the goal is fully achieved and you do not take shortcuts that compromise the reliability of the results.
 Always update guide.md to prepare it for another agent to look at it and understand the full state of the system and keep it concise. At the end of that, add all files changed (that are relevant) including guide.md to git and suggest a commit message but let me do the git commit.
 Don't stop till you achieve the goal in a reliable way without shortcuts or workarounds. Make sure you validate the results and the correctness.
+All ongoing work in this branch targets Qwen-family MoE models; keep plans, experiments, and benchmarks scoped to Qwen unless explicitly noted otherwise.
 
 
 ## Current Goal
 
-No active goal - ready for next task.
+I want to generate a plot that shows the following:
+The baseline - on-demand expert loading
+Oracle - All experts loaded on GPU
+Prefetching - Pattern-based prefetching (1 line for each number of experts prefetched, e.g. 2,4,8,16)
+
+### Status Update (2025-10-14)
+
+- ✅ Implemented `src/fiddler/qwen_oracle.py` (`FiddlerQwenOracle`) that preloads every expert onto the GPU and reuses the baseline accounting so hit rates report 100% residency.
+- ✅ Added `plot_expert_loading_strategies.py`, which benchmarks baseline vs oracle vs pattern-based prefetch (2/4/8/16) across configurable token counts and trials, then saves CSV/JSON summaries and a multi-line plot.
+- ⚠️ Not yet run on hardware — execute on a ≥24 GB bfloat16-capable GPU to populate `expert_loading_benchmark_*` outputs and inspect the generated `expert_loading_strategies.png`.
+
+### How to Run the New Benchmark
+
+```bash
+python3 plot_expert_loading_strategies.py --tokens 8 16 32 64 --trials 3 --batch-size 1 --prefetch-counts 2 4 8 16
+```
+
+- The script deletes `expert_usage_patterns_qwen.json` unless `--reuse-patterns` is set, then collects patterns automatically during the first prefetch configuration.
+- Results land under `expert_loading_benchmark_<timestamp>/` with `expert_loading_results.csv`, `expert_loading_results.json`, and `expert_loading_strategies.png`.
+- For larger batches, adjust `--batch-size` and ensure the prompt pool in the script covers the requested size or enable sampling with replacement via a bigger prompt list if needed.
+- Validate that the oracle run completes without OOM; if VRAM is tight, drop to shorter token lists or prefetch counts before retrying full sweep.
 
 ## Previous Goals
 
@@ -632,7 +653,7 @@ The comprehensive plan in `ATTENTION_BASED_PREDICTOR_PLAN.md` has been reorganiz
 
 ## 📊 Project Status
 
-**Branch**: `qwen2_with_fiddler`
+**Branch**: `predictor`
 **Model**: Qwen1.5-MoE-A2.7B
 
 Successfully implemented and benchmarked **4 optimization configurations**:
@@ -725,8 +746,8 @@ class YourImplementation:
     def tokenize(self, text):
         # Return (input_ids, position_ids)
 
-    def mixtral_forward(self, input_ids, position_ids, is_decode):
-        # Core inference - return logits tensor
+   def mixtral_forward(self, input_ids, position_ids, is_decode):
+      # Qwen implementations reuse this name; return logits for the current MoE layer stack
 ```
 
 ## ⚠️ Critical Configuration
@@ -825,5 +846,5 @@ nsys stats --report nvtx_sum qwen_prefetch_profile_*/qwen_prefetch_prediction.ns
 
 ### Model-Specific Notes
 - Qwen's small experts favor CPU at BS=1, GPU at BS≥2
-- Larger expert models (e.g., Mixtral) may have different crossover points
+- Other MoE families (e.g., Mixtral) may land on different crossover points; recalibrate before applying these Qwen-focused recommendations
 - Pattern-based prefetching (token position) outperforms gating-based (7.5% overlap)

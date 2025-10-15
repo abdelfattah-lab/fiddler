@@ -835,14 +835,26 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         else:
             raise ValueError(f"text must be a string or list of strings, got {type(text)}")
 
-        input_ids = inputs.input_ids.to(self.model.device)
-        attention_mask = inputs.attention_mask.to(self.model.device) if inputs.attention_mask is not None else None
+        if hasattr(inputs, "to"):
+            inputs = inputs.to(self.model.device)
+
+        input_ids = inputs.input_ids
+        attention_mask = inputs.attention_mask if inputs.attention_mask is not None else None
+
+        if attention_mask is not None:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+        else:
+            position_ids = torch.arange(0, input_ids.shape[-1], dtype=torch.long, device=self.model.device)
+            position_ids = position_ids.unsqueeze(0).expand(input_ids.shape[0], -1)
+
+        position_ids = position_ids.to(self.model.device)
 
         # Limit input tokens if specified
         if input_token is not None:
             input_ids = input_ids[:, :input_token]
             if attention_mask is not None:
                 attention_mask = attention_mask[:, :input_token]
+                position_ids = position_ids[:, :input_token]
 
         # Reset statistics
         self.expert_fetch_count = 0
@@ -878,21 +890,21 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         with torch.no_grad():
             # Reset cache
             self.model.generation_config.use_cache = True
-            if hasattr(self.model, 'past_key_values'):
-                self.model.past_key_values = None
 
-            # Generate with the built-in generation method but with cache reset after each token
-            # This ensures our hooks are called appropriately
+            # Generate with the built-in generation method
             # IMPORTANT: Set eos_token_id=None to force exactly output_token generations
             # This ensures pattern collection captures all token positions for benchmarking
+            # CRITICAL: Pass past_key_values=None to ensure cache is reset
             outputs = self.model.generate(
                 input_ids,
                 attention_mask=attention_mask,
+                position_ids=position_ids,
                 max_new_tokens=output_token,
                 do_sample=False,
                 pad_token_id=self.tokenizer.eos_token_id,
                 eos_token_id=None,  # Force exact token count
-                use_cache=True
+                use_cache=True,
+                past_key_values=None  # Force cache reset
             )
 
             # Token position is advanced in MoE forward during generation

@@ -55,7 +55,8 @@ class FiddlerQwen:
         """Load model on CPU, preserving integrated structure."""
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_name,
-            trust_remote_code=True
+            trust_remote_code=True,
+            padding_side='left'  # Required for batched generation with decoder-only models
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -93,6 +94,10 @@ class FiddlerQwen:
         self.model.lm_head.to(self.device)
         self.model.model.embed_tokens.to(self.device)
         self.model.model.norm.to(self.device)
+
+        # Move rotary embeddings to GPU - CRITICAL for avoiding device placement errors
+        if hasattr(self.model.model, 'rotary_emb'):
+            self.model.model.rotary_emb.to(self.device)
 
         # Move layer components to GPU, but keep experts on CPU
         for i in range(len(self.model.model.layers)):

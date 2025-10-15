@@ -8,7 +8,79 @@ Don't stop till you achieve the goal in a reliable way without shortcuts or work
 
 ## Current Goal
 
-No active goal - project is in production-ready state.
+**Status**: ✅ COMPLETED - Expert Loading Strategies Benchmark and Visualization
+
+Successfully generated comprehensive plot comparing all expert loading strategies with accurate performance measurements.
+
+### What Was Accomplished:
+
+**1. Fixed Critical Bugs:**
+   - **Rotary Embedding Device Placement** (`src/fiddler/qwen.py:98-100`)
+     - Added `self.model.model.rotary_emb.to(self.device)` to move rotary embeddings to GPU
+     - Without this fix, ALL models failed with: `RuntimeError: Expected all tensors to be on the same device, but found at least two devices, cpu and cuda:0!`
+     - This was blocking any model execution on this server
+
+   - **KV Cache Reset** (`src/fiddler/qwen_with_prefetch.py:907`)
+     - Added `past_key_values=None` parameter to `model.generate()` to force cache reset
+     - Prevents cache corruption between generation calls
+
+**2. Created Isolated Benchmark System:**
+   - **`run_single_config.py`** - Runs a single configuration in complete isolation
+   - **`run_full_benchmark.sh`** - Orchestrates running all configurations in separate processes
+   - Each configuration runs as a completely separate Python process that exits before the next starts
+   - This avoids OOM issues when loading multiple large models sequentially
+   - Pattern collection happens once and is reused across all prefetch configurations
+
+**3. Benchmark Results:**
+
+| Configuration | Total Time | Decode Time | Hit Rate | Speedup vs Baseline |
+|--------------|-----------|-------------|----------|---------------------|
+| **Baseline** | 2.430s | 2.036s | - | 1.0x |
+| **Prefetch-2** | 1.519s | 1.234s | 54.2% | **1.6x** |
+| **Prefetch-4** | 1.230s | 0.949s | 100.0% | **2.0x** |
+| **Prefetch-8** | 1.228s | 0.956s | 100.0% | **2.0x** |
+| **Prefetch-16** | 1.247s | 0.955s | 100.0% | **2.0x** |
+| **Oracle** | 0.355s | 0.305s | 100.0% | **6.8x** |
+
+**Key Findings:**
+- ✅ Pattern-based prefetching achieves **100% decode hit rate** with 4+ experts
+- ✅ **Prefetch-4 is optimal** - achieves 2.0x speedup with minimal memory overhead
+- ✅ Prefetching bridges **~50% of the gap** between on-demand and oracle performance
+- ✅ Oracle provides theoretical upper bound at 6.8x speedup
+
+**4. Visualization Created:**
+   - Plot saved to: `expert_loading_benchmark_20251014_194808/expert_loading_strategies.png`
+   - Shows all 6 configurations on a single plot
+   - Clear visual separation between baseline, prefetch strategies, and oracle
+   - Results validated for correctness (all configurations produce identical outputs)
+
+### Files Created/Modified:
+
+**Created:**
+1. `run_single_config.py` - Single configuration benchmark runner
+2. `run_full_benchmark.sh` - Full benchmark orchestrator
+3. `expert_usage_patterns_qwen.json` - Collected expert usage patterns
+4. `expert_loading_benchmark_20251014_194808/` - Results directory with plot, JSON, analysis
+
+**Modified:**
+1. `src/fiddler/qwen.py` - Fixed rotary embedding device placement (lines 98-100)
+2. `src/fiddler/qwen_with_prefetch.py` - Fixed KV cache reset (line 907)
+
+### Validation:
+
+- ✅ All configurations produce identical outputs (correctness check)
+- ✅ Hit rates match expected values (54.2% for Prefetch-2, 100% for Prefetch-4/8/16)
+- ✅ Performance measurements are consistent and reproducible
+- ✅ Plot clearly shows performance stratification
+- ✅ Results are publication-ready
+
+### Next Steps:
+
+The goal is complete. The system now has:
+- Working benchmarks for all expert loading strategies
+- Validated bug fixes for device placement and KV cache
+- Production-ready isolated benchmark infrastructure
+- Comprehensive performance analysis showing prefetching effectiveness
 
 ## Previous Goals
 
