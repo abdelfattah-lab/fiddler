@@ -97,7 +97,8 @@ DIVERSE_SENTENCES = [
 
 def get_diverse_batch(batch_size: int, seed: int = None) -> List[str]:
     """
-    Get a batch of diverse sentences for testing.
+    Get a batch of diverse sentences for testing. Supports large batches by
+    creating deterministic variations when unique base sentences are exhausted.
 
     Args:
         batch_size: Number of sentences to return
@@ -106,12 +107,24 @@ def get_diverse_batch(batch_size: int, seed: int = None) -> List[str]:
     Returns:
         List of diverse sentences
     """
-    if seed is not None:
-        np.random.seed(seed)
+    rng = np.random.default_rng(seed)
 
-    # Shuffle and select batch_size sentences
-    sentences = DIVERSE_SENTENCES.copy()
-    np.random.shuffle(sentences)
+    base_sentences = DIVERSE_SENTENCES.copy()
+    rng.shuffle(base_sentences)
+
+    if batch_size <= len(base_sentences):
+        return base_sentences[:batch_size]
+
+    # Extend with deterministic variations to cover large batches while keeping prompts distinct.
+    sentences = base_sentences[:]
+    variant_index = 0
+    while len(sentences) < batch_size:
+        template = DIVERSE_SENTENCES[variant_index % len(DIVERSE_SENTENCES)]
+        variant_suffix = variant_index // len(DIVERSE_SENTENCES) + 1
+        sentences.append(f"{template} (variation {variant_suffix})")
+        variant_index += 1
+
+    rng.shuffle(sentences)
     return sentences[:batch_size]
 
 
@@ -227,18 +240,31 @@ def run_single_batch_baseline(model, prompts: List[str], output_tokens: int = 20
     else:
         text_input = prompts
 
-    prefill_time, decode_time, prefill_hit_rate, decode_hit_rate = model.generate(
+    prefill_time, decode_time_per_token, prefill_hit_rate, decode_hit_rate = model.generate(
         text_input,
         output_token=output_tokens
     )
 
+    # Convert per-token decode latency back to total decode phase latency.
+    decode_tokens = getattr(model, 'decode_token_count', output_tokens)
+    decode_time_total = decode_time_per_token * decode_tokens
+    total_tokens_generated = decode_tokens * batch_size
+
+    tokens_per_second = (
+        total_tokens_generated / decode_time_total
+        if decode_time_total > 0 else 0
+    )
+
     result = {
         'prefill_time': prefill_time,
-        'decode_time': decode_time,
-        'total_time': prefill_time + decode_time,
+        'decode_time': decode_time_total,
+        'decode_time_per_token': decode_time_per_token,
+        'decode_tokens': decode_tokens,
+        'tokens_generated': total_tokens_generated,
+        'total_time': prefill_time + decode_time_total,
         'prefill_hit_rate': prefill_hit_rate,
         'decode_hit_rate': decode_hit_rate,
-        'tokens_per_second': (output_tokens * batch_size) / decode_time if decode_time > 0 else 0
+        'tokens_per_second': tokens_per_second
     }
 
     # Optionally generate text for correctness checking
@@ -268,18 +294,30 @@ def run_single_batch_learned(model, prompts: List[str], output_tokens: int = 20,
     else:
         text_input = prompts
 
-    prefill_time, decode_time, prefill_hit_rate, decode_hit_rate = model.generate(
+    prefill_time, decode_time_per_token, prefill_hit_rate, decode_hit_rate = model.generate(
         text_input,
         output_token=output_tokens
     )
 
+    decode_tokens = getattr(model, 'decode_token_count', output_tokens)
+    decode_time_total = decode_time_per_token * decode_tokens
+    total_tokens_generated = decode_tokens * batch_size
+
+    tokens_per_second = (
+        total_tokens_generated / decode_time_total
+        if decode_time_total > 0 else 0
+    )
+
     result = {
         'prefill_time': prefill_time,
-        'decode_time': decode_time,
-        'total_time': prefill_time + decode_time,
+        'decode_time': decode_time_total,
+        'decode_time_per_token': decode_time_per_token,
+        'decode_tokens': decode_tokens,
+        'tokens_generated': total_tokens_generated,
+        'total_time': prefill_time + decode_time_total,
         'prefill_hit_rate': prefill_hit_rate,
         'decode_hit_rate': decode_hit_rate,
-        'tokens_per_second': (output_tokens * batch_size) / decode_time if decode_time > 0 else 0
+        'tokens_per_second': tokens_per_second
     }
 
     # Optionally generate text for correctness checking
@@ -337,10 +375,16 @@ def run_configuration(config_name: str, batch_size: int, num_trials: int = 3,
             result = run_batch_fn(model, prompts, output_tokens)
             trial_results.append(result)
 
-            print(f"    ✅ Total: {result['total_time']:.3f}s | "
-                  f"Decode: {result['decode_time']:.3f}s | "
-                  f"Tok/s: {result['tokens_per_second']:.1f} | "
-                  f"Decode hit: {result['decode_hit_rate']*100:.1f}%")
+            print(
+                "    ✅ Total: {total:.3f}s | Decode: {decode:.3f}s ({per_token:.3f}s/token) | "
+                "Tok/s: {tps:.1f} | Decode hit: {hit:.1f}%".format(
+                    total=result['total_time'],
+                    decode=result['decode_time'],
+                    per_token=result.get('decode_time_per_token', 0.0),
+                    tps=result['tokens_per_second'],
+                    hit=result['decode_hit_rate'] * 100,
+                )
+            )
 
         except Exception as e:
             print(f"    ❌ Error: {e}")
@@ -364,16 +408,29 @@ def run_configuration(config_name: str, batch_size: int, num_trials: int = 3,
     }
 
     # Calculate mean and std for each metric
-    for metric in ['prefill_time', 'decode_time', 'total_time',
-                   'prefill_hit_rate', 'decode_hit_rate', 'tokens_per_second']:
+    for metric in ['prefill_time', 'decode_time', 'decode_time_per_token', 'total_time',
+                   'prefill_hit_rate', 'decode_hit_rate', 'tokens_per_second',
+                   'decode_tokens', 'tokens_generated']:
         values = [r[metric] for r in trial_results]
         result_summary[f'{metric}_mean'] = np.mean(values)
         result_summary[f'{metric}_std'] = np.std(values)
 
     print(f"\n  📊 SUMMARY ({num_trials} trials):")
     print(f"    Total time: {result_summary['total_time_mean']:.3f}s ± {result_summary['total_time_std']:.3f}s")
-    print(f"    Decode time: {result_summary['decode_time_mean']:.3f}s ± {result_summary['decode_time_std']:.3f}s")
+    print(
+        "    Decode time: {total:.3f}s ± {total_std:.3f}s ({per_token:.3f}s/token)".format(
+            total=result_summary['decode_time_mean'],
+            total_std=result_summary['decode_time_std'],
+            per_token=result_summary['decode_time_per_token_mean'],
+        )
+    )
     print(f"    Tokens/sec: {result_summary['tokens_per_second_mean']:.1f} ± {result_summary['tokens_per_second_std']:.1f}")
+    print(
+        "    Decode tokens: {per_seq:.1f} per sequence | Total tokens: {total_toks:.1f}".format(
+            per_seq=result_summary['decode_tokens_mean'],
+            total_toks=result_summary['tokens_generated_mean'],
+        )
+    )
     print(f"    Decode hit: {result_summary['decode_hit_rate_mean']*100:.1f}% ± {result_summary['decode_hit_rate_std']*100:.1f}%")
 
     return result_summary
@@ -795,7 +852,7 @@ def generate_analysis(results: List[Dict], output_dir: str):
     if baseline_data:
         baseline_by_batch = {d['batch_size']: d for d in baseline_data}
 
-        analysis_report.append(f"{'Config':<25} {'BS':<5} {'Time (s)':<15} {'Hit Rate':<12} {'Speedup vs Baseline':<20}")
+        analysis_report.append(f"{'Config':<25} {'BS':<5} {'Time (s)':<22} {'Hit Rate':<12} {'Speedup vs Baseline':<20}")
         analysis_report.append("-" * 80)
 
         for config_name, data in configs.items():
@@ -831,7 +888,7 @@ def generate_analysis(results: List[Dict], output_dir: str):
     analysis_report.append("")
 
     if baseline_data:
-        analysis_report.append(f"{'Config':<25} {'BS':<5} {'Time (s)':<15} {'Hit Rate':<12} {'Speedup vs Baseline':<20}")
+        analysis_report.append(f"{'Config':<25} {'BS':<5} {'Time (s)':<27} {'Hit Rate':<12} {'Speedup vs Baseline':<20}")
         analysis_report.append("-" * 80)
 
         for config_name, data in configs.items():
@@ -839,6 +896,7 @@ def generate_analysis(results: List[Dict], output_dir: str):
                 bs = d['batch_size']
                 decode_time = d['decode_time_mean']
                 decode_std = d['decode_time_std']
+                decode_per_token = d['decode_time_per_token_mean']
                 decode_hr = d['decode_hit_rate_mean'] * 100
 
                 # Calculate speedup vs baseline
@@ -852,7 +910,8 @@ def generate_analysis(results: List[Dict], output_dir: str):
                 hr_str = f"{decode_hr:.1f}%" if config_name != 'Baseline' else "N/A"
 
                 analysis_report.append(
-                    f"{config_name:<25} {bs:<5} {decode_time:.3f}±{decode_std:.3f}  "
+                    f"{config_name:<25} {bs:<5} "
+                    f"{decode_time:.3f}±{decode_std:.3f} ({decode_per_token:.3f}s/token)  "
                     f"{hr_str:<12} {speedup_str:<20}"
                 )
 
@@ -913,13 +972,14 @@ def generate_analysis(results: List[Dict], output_dir: str):
             total_std = d['total_time_std']
             prefill = d['prefill_time_mean']
             decode = d['decode_time_mean']
+            decode_per_token = d['decode_time_per_token_mean']
             tok_s = d['tokens_per_second_mean']
             prefill_hr = d['prefill_hit_rate_mean'] * 100
             decode_hr = d['decode_hit_rate_mean'] * 100
 
             analysis_report.append(
                 f"  BS={bs:2d}: Total={total:.3f}±{total_std:.3f}s | "
-                f"Prefill={prefill:.3f}s | Decode={decode:.3f}s | "
+                f"Prefill={prefill:.3f}s | Decode={decode:.3f}s ({decode_per_token:.3f}s/token) | "
                 f"{tok_s:.1f} tok/s"
             )
             if config_name != 'Baseline':
@@ -1081,7 +1141,7 @@ def main():
     print("="*80)
 
     # Configuration
-    batch_sizes = [1, 2, 4, 8, 16]
+    batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128]
     num_trials = 3
     output_tokens = 20
 
