@@ -37,17 +37,24 @@ class AttentionBasedExpertPredictor(nn.Module):
         self.fc2 = nn.Linear(2048, n_moe_layers * n_experts)
 
     def forward(self, attention_output):
-        batch_size, seq_len, _ = attention_output.shape if len(attention_output.shape) == 3 else (attention_output.shape[0], 1, attention_output.shape[1])
-
-        if len(attention_output.shape) == 2:
-            attention_output = attention_output.unsqueeze(1)
+        # Extract dimensions properly
+        if len(attention_output.shape) == 3:
+            batch_size, seq_len, _ = attention_output.shape
+        elif len(attention_output.shape) == 2:
+            # Single sequence without batch dimension
+            attention_output = attention_output.unsqueeze(1)  # Add seq_len dimension
+            batch_size, seq_len, _ = attention_output.shape
+        else:
+            raise ValueError(f"Unexpected attention_output shape: {attention_output.shape}")
 
         x = self.fc1(attention_output)
         x = self.activation(x)
         x = self.dropout(x)
         x = self.fc2(x)
 
-        expert_scores = x.view(-1, self.n_moe_layers, self.n_experts)
+        # CRITICAL FIX: Maintain batch and sequence dimensions separately
+        # Instead of view(-1, ...) which merges batch and seq_len, we properly reshape:
+        expert_scores = x.view(batch_size, seq_len, self.n_moe_layers, self.n_experts)
 
         return expert_scores
 

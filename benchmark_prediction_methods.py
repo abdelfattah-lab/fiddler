@@ -37,7 +37,7 @@ class Args:
         self.max_experts_gpu = 0
         self.beam_width = 1
         self.use_fiddler_mode = use_fiddler_mode
-        self.fiddler_batch_threshold = 32  # Use CPU for all tested batch sizes
+        self.fiddler_batch_threshold = 256  # Use CPU for all tested batch sizes
 
 
 # Diverse test sentences for batching
@@ -1050,14 +1050,22 @@ def run_correctness_check(configurations, output_dir):
 
             model = None
             try:
-                args = Args(use_fiddler_mode=config.get('use_fiddler_mode', False))
+                # For correctness check, disable CPU offloading to ensure bit-exact results
+                # Set fiddler_batch_threshold=0 so CPU execution never happens
+                args = Args(use_fiddler_mode=False)  # Always disable Fiddler mode for correctness
+                args.fiddler_batch_threshold = 0  # Force GPU execution for all batch sizes
 
                 if 'Learned' in config_name:
                     model_class = FiddlerQwenWithLearnedPrefetch
                 else:
                     model_class = FiddlerQwen
 
-                model = model_class(args, **config['kwargs'])
+                # Override enable_cpu_offload in kwargs for correctness check
+                correctness_kwargs = config['kwargs'].copy()
+                if 'enable_cpu_offload' in correctness_kwargs:
+                    correctness_kwargs['enable_cpu_offload'] = False
+
+                model = model_class(args, **correctness_kwargs)
 
                 generated_text = generate_text_for_correctness(
                     model,

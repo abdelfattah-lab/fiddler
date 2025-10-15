@@ -61,7 +61,8 @@ class FiddlerQwen:
         """Load model on CPU, preserving integrated structure."""
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_name,
-            trust_remote_code=True
+            trust_remote_code=True,
+            padding_side='left'  # Use left-padding for decoder-only models
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
