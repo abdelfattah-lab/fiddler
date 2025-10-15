@@ -507,6 +507,8 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
             self.prefill_time += layer_time
         else:
             self.decode_time += layer_time
+            if not self.moe_layers or layer_idx == self.moe_layers[-1]:
+                self.decode_token_count += 1
 
         return final_hidden_states.view(batch_size, sequence_length, hidden_dim), router_logits
 
@@ -821,7 +823,7 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
             input_token: Limit on input token count
 
         Returns:
-            Tuple of (prefill_time, decode_time, prefill_hit_rate, decode_hit_rate)
+            Tuple of (prefill_time, decode_time_per_token, prefill_hit_rate, decode_hit_rate)
         """
         # Handle text input - support both single and batched inputs
         if text is None:
@@ -874,6 +876,7 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         # Reset timing statistics
         self.prefill_time = 0.0
         self.decode_time = 0.0
+        self.decode_token_count = 0
 
         start_time = time.time()
 
@@ -918,11 +921,11 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         # Use actual measured times from MoE layer tracking
         # Note: self.prefill_time and self.decode_time are accumulated across all MoE layers
         prefill_time = self.prefill_time
-        decode_time = self.decode_time
+        decode_time = self.decode_time / self.decode_token_count if self.decode_token_count else 0.0
 
         print(f"Generated: {generated_text}")
         print(f"🎯 Prefetch hit rate - Overall: {overall_hit_rate:.1%}, Prefill: {prefill_hit_rate:.1%}, Decode: {decode_hit_rate:.1%}")
-        print(f"⏱️  Prefill: {prefill_time:.3f}s, Decode: {decode_time:.3f}s")
+        print(f"⏱️  Prefill: {prefill_time:.3f}s, Decode/token: {decode_time:.3f}s")
 
         # Print CPU offloading statistics if enabled
         if self.enable_cpu_offload:
@@ -932,7 +935,7 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
             print(f"🖥️  CPU offloading: {self.cpu_expert_count} CPU ({cpu_pct:.1f}%), {self.gpu_expert_count} GPU ({gpu_pct:.1f}%)")
             print(f"⚡ CPU exec time: {self.cpu_execution_time:.3f}s, GPU exec time: {self.gpu_execution_time:.3f}s")
 
-        # Return separate hit rates for prefill and decode
+    # Return separate hit rates for prefill and decode (decode time is per token)
         return (prefill_time, decode_time, prefill_hit_rate, decode_hit_rate)
 
     def get_prefetch_stats(self):

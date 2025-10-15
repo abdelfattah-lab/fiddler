@@ -8,9 +8,83 @@ Don't stop till you achieve the goal in a reliable way without shortcuts or work
 
 ## Current Goal
 
-No active goal - project is in production-ready state.
+**Status**: ✅ COMPLETED - Nsight Systems Profiling and Speedup Analysis
+
+Successfully profiled and analyzed the configurations that achieved speedup in learned prefetch over Fiddler-only.
+
+### What Was Done:
+
+**1. Created Profiling Infrastructure:**
+- `profile_fiddler_bs8.py` - Profile Fiddler-only at BS=8
+- `profile_fiddler_learned_bs8.py` - Profile Fiddler+Learned at BS=8
+- `profile_fiddler_bs16.py` - Profile Fiddler-only at BS=16
+- `profile_fiddler_learned_bs16.py` - Profile Fiddler+Learned at BS=16
+- `analyze_speedup_profiles.py` - Statistical analysis script
+
+**2. Generated Nsight Systems Profiles:**
+Located in `speedup_profiles/`:
+- `fiddler_bs8.nsys-rep` (23MB) - Fiddler-only at BS=8
+- `fiddler_learned_bs8.nsys-rep` (33MB) - Fiddler+Learned at BS=8
+- `fiddler_bs16.nsys-rep` (31MB) - Fiddler-only at BS=16
+- `fiddler_learned_bs16.nsys-rep` (48MB) - Fiddler+Learned at BS=16
+
+**3. Key Findings:**
+
+**Batch Size 8:**
+- Fiddler-only: 6.250s (99.6% CPU, 0.4% GPU)
+- Fiddler+Learned: 5.972s (77.7% CPU, 22.3% GPU)
+- **Speedup: 1.047x** (4.4% faster)
+- **Root cause**: 2,483 expert executions moved from CPU to GPU
+
+**Batch Size 16:**
+- Fiddler-only: 9.333s (99.6% CPU, 0.4% GPU)
+- Fiddler+Learned: 8.936s (82.1% CPU, 17.9% GPU)
+- **Speedup: 1.044x** (4.3% faster)
+- **Root cause**: 2,803 expert executions moved from CPU to GPU
+
+**Why Learned Prefetch Wins:**
+1. **Higher prefill hit rates** (92.4% vs 69.9% at BS=8, 83.6% vs 62.1% at BS=16)
+2. **Better expert placement** - Predictor enables shifting experts from CPU to GPU
+3. **Reduced CPU execution time** (15-16% reduction)
+4. **Prefill phase benefits most** (9-12% speedup)
+
+**4. Comprehensive Report:**
+- `speedup_profiles/SPEEDUP_ANALYSIS_REPORT.md` - Complete analysis with:
+  - Detailed performance metrics
+  - Root cause analysis
+  - Technical mechanisms explanation
+  - Recommendations for production deployment
+  - Comparison with benchmark results
+  - Instructions for GUI analysis
+
+### Files Created:
+1. `speedup_profiles/SPEEDUP_ANALYSIS_REPORT.md` - Main report (~450 lines)
+2. `speedup_profiles/*.nsys-rep` - 4 profile files for GUI analysis (135MB total)
+3. `speedup_profiles/*.log` - Console outputs from profiling runs
+4. `profile_*.py` - 4 profiling scripts
+5. `analyze_speedup_profiles.py` - Analysis automation
+
+### How to Analyze with Nsight Systems GUI:
+```bash
+# Open any profile in GUI
+nsight-sys speedup_profiles/fiddler_bs8.nsys-rep
+
+# Or generate CLI statistics
+nsys stats --report nvtx_sum,cuda_api_sum speedup_profiles/fiddler_bs8.nsys-rep
+```
+
+### Next Steps:
+All artifacts ready for further analysis. The .nsys-rep files can be opened in Nsight Systems GUI for detailed visual inspection of CUDA kernels, memory transfers, and CPU/GPU overlap.
 
 ## Previous Goals
+
+## Latest Updates (2025-10-14)
+
+- Implemented the cost-model TODO in `src/fiddler/qwen_with_prefetch.py`, matching Mixtral's CPU/GPU latency handling and ignoring empty expert assignments.
+- Added `test_cost_model_alignment.py`, a lightweight harness that stubs the heavy model and exercises cost computations across resident, prefetched, and default experts.
+- Verified via `python test_cost_model_alignment.py` (Torch available) that all scenarios pass; no other regression tests required for this change.
+- Expanded `run_correctness_check()` in `benchmark_prediction_methods.py` to cover both single and batched prompts, ensuring the benchmark validates multi-input correctness before long runs. The JSON output now records per-scenario status.
+
 
 **Status**: ✅ COMPLETED - Getting Started Documentation
 

@@ -146,6 +146,7 @@ class FiddlerQwen:
         # Timing statistics for prefill vs decode
         self.prefill_time = 0.0
         self.decode_time = 0.0
+        self.decode_token_count = 0
         self.is_first_forward = True  # Track if we're in prefill phase
 
         print("✅ Expert management ready")
@@ -329,6 +330,8 @@ class FiddlerQwen:
             self.prefill_time += layer_time
         else:
             self.decode_time += layer_time
+            if not self.moe_layers or layer_idx == self.moe_layers[-1]:
+                self.decode_token_count += 1
 
         return final_hidden_states, router_logits
 
@@ -527,7 +530,7 @@ class FiddlerQwen:
             input_token: Limit on input token count
 
         Returns:
-            Tuple of (prefill_time, decode_time, prefill_hit_rate, decode_hit_rate)
+            Tuple of (prefill_time, decode_time_per_token, prefill_hit_rate, decode_hit_rate)
         """
         # Handle text input - support both single and batched inputs
         if text is None:
@@ -562,6 +565,7 @@ class FiddlerQwen:
         # Reset timing statistics
         self.prefill_time = 0.0
         self.decode_time = 0.0
+        self.decode_token_count = 0
 
         start_time = time.time()
 
@@ -589,12 +593,12 @@ class FiddlerQwen:
         # Use actual measured times from MoE layer tracking
         # Note: self.prefill_time and self.decode_time are accumulated across all MoE layers
         prefill_time = self.prefill_time
-        decode_time = self.decode_time
+        decode_time = self.decode_time / self.decode_token_count if self.decode_token_count else 0.0
 
         print(f"Generated: {generated_text}")
-        print(f"⏱️  Prefill: {prefill_time:.3f}s, Decode: {decode_time:.3f}s")
+        print(f"⏱️  Prefill: {prefill_time:.3f}s, Decode/token: {decode_time:.3f}s")
 
-        # Return format: (prefill_time, decode_time, prefill_hit_rate, decode_hit_rate)
+    # Return format: (prefill_time, decode_time_per_token, prefill_hit_rate, decode_hit_rate)
         # Baseline doesn't track phase-specific hit rates, so return same rate for both
         return (prefill_time, decode_time, hit_rate, hit_rate)
 
