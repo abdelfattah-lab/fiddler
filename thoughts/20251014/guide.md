@@ -8,7 +8,120 @@ Don't stop till you achieve the goal in a reliable way without shortcuts or work
 
 ## Current Goal
 
-No current goal. Waiting for next task.
+**Status**: ✅ COMPLETED - Binary Cross-Entropy Loss for Direct Expert Selection
+
+Successfully modified train_predictor.py to use binary cross-entropy loss for direct expert selection optimization.
+
+### What Was Changed:
+
+**Problem Statement:**
+The previous training approach used KL divergence loss to match predicted gating distributions with actual gating distributions. This is an indirect way to optimize for expert selection - we're trying to predict exact scores when we really just need to predict which experts will be selected.
+
+**Solution Implemented:**
+
+**1. Added `binary_cross_entropy_loss()` function (`train_predictor.py` lines 154-194):**
+   - Converts gating scores to binary targets (top-4 = 1, rest = 0)
+   - Uses `torch.nn.functional.binary_cross_entropy_with_logits` for numerical stability
+   - Directly optimizes for expert selection rather than score matching
+   - Simplified training objective: "Will this expert be selected or not?"
+
+**2. Updated `train_epoch()` to support 'bce' loss function (`train_predictor.py` line 252):**
+   - Added condition to use `binary_cross_entropy_loss` when `loss_fn == 'bce'`
+   - Maintains backward compatibility with 'kl' and 'mse' loss functions
+
+**3. Updated `validate()` to support 'bce' loss function (`train_predictor.py` line 299):**
+   - Added condition to use `binary_cross_entropy_loss` during validation
+   - Consistent loss computation across training and validation
+
+**4. Changed default configuration (`train_predictor.py` line 325):**
+   - Updated default `loss_function` from 'kl' to 'bce'
+   - Added comment explaining the new loss function option
+   - Maintains backward compatibility by supporting all three loss functions
+
+### Key Benefits:
+
+1. **Direct Optimization**: Directly optimizes for expert selection (binary classification) rather than score prediction (distribution matching)
+2. **Simplified Objective**: Binary targets (1/0) are simpler than matching full probability distributions
+3. **Better Alignment**: Training objective now matches the actual task (selecting top-k experts)
+4. **Numerical Stability**: Uses `binary_cross_entropy_with_logits` which is more stable than softmax + cross-entropy
+5. **Backward Compatible**: Keeps 'kl' and 'mse' options available for comparison
+
+### Technical Details:
+
+**Binary Target Creation:**
+- For each layer, identify top-4 experts from true gating distribution
+- Create binary tensor: 1 for top-4 experts, 0 for rest
+- Shape: [batch, n_moe_layers, n_experts] → [batch, 22, 60]
+
+**Loss Computation:**
+- Apply BCE with logits to predicted scores vs binary targets
+- No softmax/sigmoid needed - BCE with logits handles it internally
+- Mean reduction across all experts and layers
+
+**Top-k Accuracy Metric:**
+- Unchanged - still measures overlap between predicted top-4 and true top-4
+- This metric now directly corresponds to what the loss optimizes for
+
+### Files Modified:
+1. `train_predictor.py` - Added BCE loss function, updated training/validation loops, changed default config
+2. `test_bce_loss.py` - Created comprehensive test suite for BCE loss validation (NEW)
+
+### Validation:
+- ✅ Syntax check passed (`python3 -m py_compile train_predictor.py`)
+- ✅ Binary target creation logic verified
+- ✅ Loss function properly integrated into training and validation
+- ✅ Backward compatibility maintained (kl, mse, bce all supported)
+- ✅ Default configuration updated to use new loss function
+
+### Training Started:
+
+**Status**: ✅ TRAINING IN PROGRESS
+
+Training started successfully in new directory `predictor_checkpoints_bce/`:
+
+```bash
+~/miniconda3/envs/fiddler/bin/python train_predictor.py > training_bce.log 2>&1 &
+```
+
+**Training Configuration:**
+- Output directory: `predictor_checkpoints_bce/` (new, won't override existing)
+- Loss function: BCE (binary cross-entropy for direct expert selection)
+- Model parameters: 6.90M
+- Train samples: 45,000 / Val samples: 5,000
+- Batch size: 256
+- Learning rate: 1e-4
+- Epochs: 10
+- Device: CUDA
+
+**Initial Progress (Epoch 1):**
+- Loss: ~0.692
+- Accuracy: ~6.4% (expected to be low initially)
+- Training speed: ~7.8s per batch
+- Total batches: 176 per epoch
+- Estimated time per epoch: ~23 minutes
+- Total training time: ~4 hours
+
+**Additional Fix Applied:**
+- Fixed shape mismatch issue: model outputs `[batch, 1, 22, 60]` but loss expects `[batch, 22, 60]`
+- Added `.squeeze(1)` in both `train_epoch()` and `validate()` to remove seq_len dimension
+- Training now progressing smoothly
+
+**Monitoring:**
+```bash
+# Check progress
+tail -f training_bce.log
+
+# Check training process
+ps aux | grep train_predictor.py
+```
+
+Expected improvements over KL divergence:
+- More direct optimization for expert selection task
+- Better alignment between training objective and inference behavior
+- Simpler training dynamics (binary classification vs distribution matching)
+- Potentially higher top-4 accuracy (comparing against 46.8% from KL model)
+
+---
 
 ## Previous Goals
 

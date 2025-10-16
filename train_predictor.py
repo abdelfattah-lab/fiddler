@@ -151,6 +151,48 @@ def mse_loss(predicted_logits, true_distribution):
 
     return loss
 
+def binary_cross_entropy_loss(predicted_logits, true_distribution, k=4):
+    """
+    Compute binary cross-entropy loss for expert selection.
+
+    The goal is to predict which experts will be used (top-k) rather than
+    predicting the exact gating scores. This simplifies the training objective
+    to a binary classification task: will this expert be selected or not?
+
+    Args:
+        predicted_logits: [batch, n_moe_layers, n_experts] - predicted logits
+        true_distribution: [batch, n_moe_layers, n_experts] - ground truth gating scores
+        k: number of experts to select (default 4, matching Qwen's top-k)
+
+    Returns:
+        loss: scalar binary cross-entropy loss
+    """
+    # Convert true distribution to binary targets (top-k = 1, rest = 0)
+    # Get top-k indices for each layer
+    _, true_top_k_indices = torch.topk(true_distribution, k, dim=-1)  # [batch, n_moe_layers, k]
+
+    # Create binary target tensor (all zeros)
+    binary_targets = torch.zeros_like(true_distribution)  # [batch, n_moe_layers, n_experts]
+
+    # Set top-k positions to 1
+    # We need to scatter 1s at the top-k positions
+    batch_size, n_moe_layers, n_experts = true_distribution.shape
+
+    # Create indices for scatter operation
+    batch_indices = torch.arange(batch_size, device=true_distribution.device)[:, None, None].expand(-1, n_moe_layers, k)
+    layer_indices = torch.arange(n_moe_layers, device=true_distribution.device)[None, :, None].expand(batch_size, -1, k)
+
+    # Set binary targets to 1 for top-k experts
+    binary_targets[batch_indices, layer_indices, true_top_k_indices] = 1.0
+
+    # Compute binary cross-entropy loss
+    # BCE with logits is more numerically stable than applying sigmoid + BCE
+    loss = torch.nn.functional.binary_cross_entropy_with_logits(
+        predicted_logits, binary_targets, reduction='mean'
+    )
+
+    return loss
+
 def calculate_top_k_accuracy(predicted_logits, true_distribution, k=4):
     """
     Calculate top-k accuracy: fraction of true top-k experts in predicted top-k.
@@ -199,13 +241,17 @@ def train_epoch(model, dataloader, optimizer, device, epoch, loss_fn='kl', use_w
         gating_scores = batch['gating_scores'].to(device)  # [batch, 22, 60]
 
         # Forward pass
-        predicted_logits = model(attention_output)  # [batch, 22, 60]
+        predicted_logits = model(attention_output)  # [batch, seq_len, 22, 60]
+        # Squeeze out the seq_len dimension (should be 1 for single token attention)
+        predicted_logits = predicted_logits.squeeze(1)  # [batch, 22, 60]
 
         # Compute loss
         if loss_fn == 'kl':
             loss = kl_divergence_loss(predicted_logits, gating_scores)
         elif loss_fn == 'mse':
             loss = mse_loss(predicted_logits, gating_scores)
+        elif loss_fn == 'bce':
+            loss = binary_cross_entropy_loss(predicted_logits, gating_scores, k=4)
         else:
             raise ValueError(f"Unknown loss function: {loss_fn}")
 
@@ -246,11 +292,15 @@ def validate(model, dataloader, device, loss_fn='kl'):
             gating_scores = batch['gating_scores'].to(device)
 
             predicted_logits = model(attention_output)
+            # Squeeze out the seq_len dimension (should be 1 for single token attention)
+            predicted_logits = predicted_logits.squeeze(1)  # [batch, 22, 60]
 
             if loss_fn == 'kl':
                 loss = kl_divergence_loss(predicted_logits, gating_scores)
             elif loss_fn == 'mse':
                 loss = mse_loss(predicted_logits, gating_scores)
+            elif loss_fn == 'bce':
+                loss = binary_cross_entropy_loss(predicted_logits, gating_scores, k=4)
             else:
                 raise ValueError(f"Unknown loss function: {loss_fn}")
 
@@ -266,7 +316,7 @@ def main():
     # Configuration
     config = {
         'data_dir': 'predictor_training_data',
-        'output_dir': 'predictor_checkpoints',
+        'output_dir': 'predictor_checkpoints_bce',
         'hidden_dim': 2048,
         'n_moe_layers': 22,  # Predict for MoE layers 2-23 (skip 0-1 which are GPU-resident)
         'n_experts': 60,
@@ -276,11 +326,11 @@ def main():
         'num_epochs': 10,
         'val_split': 0.1,
         'max_samples': 50000,  # Limit dataset size for faster training (None = use all)
-        'loss_function': 'kl',  # 'kl' or 'mse'
+        'loss_function': 'bce',  # 'kl', 'mse', or 'bce' (binary cross-entropy for direct expert selection)
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
         'use_wandb': WANDB_AVAILABLE,
         'wandb_project': 'fiddler-expert-predictor',
-        'wandb_run_name': 'attention-based-predictor-v1'
+        'wandb_run_name': 'attention-based-predictor-bce'
     }
 
     os.makedirs(config['output_dir'], exist_ok=True)
