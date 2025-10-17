@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 from fiddler.qwen import FiddlerQwen
 from fiddler.qwen_with_learned_prefetch import FiddlerQwenWithLearnedPrefetch
+from fiddler.qwen_with_oracle_prefetch import FiddlerQwenWithOraclePrefetch
 
 
 class Args:
@@ -327,6 +328,64 @@ def run_single_batch_learned(model, prompts: List[str], output_tokens: int = 20,
     return result
 
 
+def run_single_batch_oracle(model, prompts: List[str], output_tokens: int = 20,
+                            batch_size: int = 1, trial: int = 0,
+                            return_generated_text: bool = False) -> Dict:
+    """
+    Run oracle prefetch model on a batch.
+    Generates prompt keys matching the oracle collection format.
+
+    Args:
+        model: The oracle model to run
+        prompts: List of input prompts
+        output_tokens: Number of tokens to generate
+        batch_size: Batch size (for prompt key generation)
+        trial: Trial number (seed for prompt key generation)
+        return_generated_text: If True, also generate and return text for correctness checking
+    """
+    # Generate prompt keys matching oracle collection format: "bs{batch_size}_seed{seed}_prompt{idx}"
+    prompt_keys = [f"bs{batch_size}_seed{trial}_prompt{idx}" for idx in range(len(prompts))]
+
+    # Use generate method with proper input and prompt keys
+    if len(prompts) == 1:
+        text_input = prompts[0]
+    else:
+        text_input = prompts
+
+    prefill_time, decode_time_per_token, prefill_hit_rate, decode_hit_rate = model.generate(
+        text_input,
+        output_token=output_tokens,
+        prompt_keys=prompt_keys
+    )
+
+    decode_tokens = getattr(model, 'decode_token_count', output_tokens)
+    decode_time_total = decode_time_per_token * decode_tokens
+    total_tokens_generated = decode_tokens * batch_size
+
+    tokens_per_second = (
+        total_tokens_generated / decode_time_total
+        if decode_time_total > 0 else 0
+    )
+
+    result = {
+        'prefill_time': prefill_time,
+        'decode_time': decode_time_total,
+        'decode_time_per_token': decode_time_per_token,
+        'decode_tokens': decode_tokens,
+        'tokens_generated': total_tokens_generated,
+        'total_time': prefill_time + decode_time_total,
+        'prefill_hit_rate': prefill_hit_rate,
+        'decode_hit_rate': decode_hit_rate,
+        'tokens_per_second': tokens_per_second
+    }
+
+    # Optionally generate text for correctness checking
+    if return_generated_text:
+        result['generated_text'] = generate_text_for_correctness(model, prompts, output_tokens)
+
+    return result
+
+
 def run_configuration(config_name: str, batch_size: int, num_trials: int = 3,
                      output_tokens: int = 20, use_fiddler_mode: bool = False, **model_kwargs) -> Dict:
     """
@@ -350,8 +409,13 @@ def run_configuration(config_name: str, batch_size: int, num_trials: int = 3,
     # Create args with Fiddler mode if needed
     args = Args(use_fiddler_mode=use_fiddler_mode)
 
-    # Determine model class
-    if 'Learned' in config_name:
+    # Determine model class and run function
+    if 'Oracle' in config_name:
+        model_class = FiddlerQwenWithOraclePrefetch
+        run_batch_fn = lambda model, prompts, output_tokens: run_single_batch_oracle(
+            model, prompts, output_tokens, batch_size, trial
+        )
+    elif 'Learned' in config_name:
         model_class = FiddlerQwenWithLearnedPrefetch
         run_batch_fn = run_single_batch_learned
     else:
@@ -372,7 +436,11 @@ def run_configuration(config_name: str, batch_size: int, num_trials: int = 3,
         print(f"    Prompts: {[p[:30] + '...' for p in prompts[:3]]}")
 
         try:
-            result = run_batch_fn(model, prompts, output_tokens)
+            # For oracle, we need to recreate the run function with the current trial number
+            if 'Oracle' in config_name:
+                result = run_single_batch_oracle(model, prompts, output_tokens, batch_size, trial)
+            else:
+                result = run_batch_fn(model, prompts, output_tokens)
             trial_results.append(result)
 
             print(
@@ -459,7 +527,9 @@ def plot_results(results: List[Dict], output_dir: str):
         'Baseline': '#1f77b4',
         'Fiddler': '#2ca02c',
         'Learned-Prefetch': '#ff7f0e',
-        'Fiddler+Learned-Prefetch': '#d62728'
+        'Fiddler+Learned-Prefetch': '#d62728',
+        'Oracle-Prefetch': '#9467bd',  # Purple for oracle (perfect prediction)
+        'Fiddler+Oracle-Prefetch': '#8c564b'  # Brown for fiddler+oracle
     }
 
     # ============================================================================
@@ -1055,7 +1125,9 @@ def run_correctness_check(configurations, output_dir):
                 args = Args(use_fiddler_mode=False)  # Always disable Fiddler mode for correctness
                 args.fiddler_batch_threshold = 0  # Force GPU execution for all batch sizes
 
-                if 'Learned' in config_name:
+                if 'Oracle' in config_name:
+                    model_class = FiddlerQwenWithOraclePrefetch
+                elif 'Learned' in config_name:
                     model_class = FiddlerQwenWithLearnedPrefetch
                 else:
                     model_class = FiddlerQwen
@@ -1175,7 +1247,7 @@ def main():
             'name': 'Learned-Prefetch',
             'use_fiddler_mode': False,
             'kwargs': {
-                'num_experts_to_prefetch': 8,
+                'num_experts_to_prefetch': 4,
                 'enable_cpu_offload': False,
                 'predictor_path': 'predictor_checkpoints/best_model.pt'
             }
@@ -1184,11 +1256,31 @@ def main():
             'name': 'Fiddler+Learned-Prefetch',
             'use_fiddler_mode': False,  # Learned prefetch has its own CPU offload
             'kwargs': {
-                'num_experts_to_prefetch': 8,
+                'num_experts_to_prefetch': 4,
                 'enable_cpu_offload': True,
                 'latency_cpu': 0.1,
                 'latency_gpu': 10.0,
                 'predictor_path': 'predictor_checkpoints/best_model.pt'
+            }
+        },
+        {
+            'name': 'Oracle-Prefetch',
+            'use_fiddler_mode': False,
+            'kwargs': {
+                'num_experts_to_prefetch': 4,  # Qwen uses top-4
+                'enable_cpu_offload': False,
+                'oracle_path': 'oracle_gating_decisions.json'
+            }
+        },
+        {
+            'name': 'Fiddler+Oracle-Prefetch',
+            'use_fiddler_mode': False,
+            'kwargs': {
+                'num_experts_to_prefetch': 4,  # Qwen uses top-4
+                'enable_cpu_offload': True,
+                'latency_cpu': 0.1,
+                'latency_gpu': 10.0,
+                'oracle_path': 'oracle_gating_decisions.json'
             }
         }
     ]
