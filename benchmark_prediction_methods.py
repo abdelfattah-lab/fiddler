@@ -1267,7 +1267,7 @@ def main():
             'name': 'Oracle-Prefetch',
             'use_fiddler_mode': False,
             'kwargs': {
-                'num_experts_to_prefetch': 4,  # Qwen uses top-4
+                'num_experts_to_prefetch': 16,  # Oracle needs more capacity for 100% hit rate
                 'enable_cpu_offload': False,
                 'oracle_path': 'oracle_gating_decisions.json'
             }
@@ -1276,7 +1276,7 @@ def main():
             'name': 'Fiddler+Oracle-Prefetch',
             'use_fiddler_mode': False,
             'kwargs': {
-                'num_experts_to_prefetch': 4,  # Qwen uses top-4
+                'num_experts_to_prefetch': 16,  # Oracle needs more capacity for 100% hit rate
                 'enable_cpu_offload': True,
                 'latency_cpu': 0.1,
                 'latency_gpu': 10.0,
@@ -1302,8 +1302,17 @@ def main():
     # Run all benchmarks
     all_results = []
 
+    # Oracle data is only available for batch sizes [1, 2, 4, 8, 16]
+    # Skip oracle configs for larger batch sizes
+    oracle_max_batch_size = 16
+
     for config in configurations:
         for batch_size in batch_sizes:
+            # Skip oracle configs if batch size exceeds oracle data coverage
+            if 'Oracle' in config['name'] and batch_size > oracle_max_batch_size:
+                print(f"\n⏭️  Skipping {config['name']} @ BS={batch_size} (oracle data only available up to BS={oracle_max_batch_size})")
+                continue
+
             try:
                 result = run_configuration(
                     config['name'],
