@@ -28,6 +28,7 @@ class ExpertUsageProfiler:
         self.expert_patterns = {}  # token_pos -> {layer_id: [expert1, expert2, expert3, expert4]}
         self.current_token_pos = 0
         self.collection_mode = True
+        self.prefill_seq_length = 0  # Track sequence length from prefill phase
 
     def record_layer_experts(self, layer_id, selected_experts):
         """Record the exact top-k experts for this layer at current token position."""
@@ -44,7 +45,14 @@ class ExpertUsageProfiler:
 
     def advance_token_position(self):
         """Move to next token position (called after each complete forward pass)."""
-        self.current_token_pos += 1
+        # For prefill, stay at position 0 (or use all positions)
+        # After prefill, jump to prefill_seq_length and then increment normally
+        if self.current_token_pos == 0 and self.prefill_seq_length > 0:
+            # Transition from prefill to decode: jump to sequence length
+            self.current_token_pos = self.prefill_seq_length
+        else:
+            # Normal decode: increment by 1
+            self.current_token_pos += 1
 
     def get_experts_for_layer(self, layer_id, token_pos):
         """O(1) lookup: return exact experts needed for this layer at this token position."""
@@ -285,6 +293,11 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
 
         # Determine if we're in prefill (sequence_length > 1) or decode (sequence_length == 1) phase
         is_prefill = sequence_length > 1
+
+        # Track prefill sequence length for correct token position indexing during decode
+        if is_prefill and self.profiler.prefill_seq_length == 0:
+            # First time seeing prefill - record the sequence length
+            self.profiler.prefill_seq_length = sequence_length
 
         # Set the phase in metrics tracker
         self.metrics.set_phase("prefill" if is_prefill else "decode")
@@ -881,6 +894,7 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         # Reset profiler token position for new generation
         if not self.collection_mode:
             self.profiler.current_token_pos = 0
+            self.profiler.prefill_seq_length = 0  # Reset for new generation
 
         # CRITICAL: Clear prefetch caches to avoid stale experts from previous generation
         self.prefetch_cache_A.clear()
@@ -891,6 +905,15 @@ class FiddlerQwenWithPrefetch(FiddlerQwen):
         self.prefill_time = 0.0
         self.decode_time = 0.0
         self.decode_token_count = 0
+
+        # CRITICAL FIX: Prefetch for first predicted layers BEFORE generation starts
+        # Prefetch is normally triggered AFTER layer N for layer N+2, but layers 2-3
+        # (first predicted layers) have no prior layer to trigger them.
+        # Solution: Manually trigger prefetch for first 2 predicted layers before generation.
+        if not self.collection_mode and len(self.moe_layers) > 2:
+            # Prefetch for layers 2 and 3 (first predicted layers) at token position 0
+            for layer_idx in self.moe_layers[2:4]:
+                self._trigger_prefetch_for_layer(layer_idx, token_pos=0)
 
         start_time = time.time()
 

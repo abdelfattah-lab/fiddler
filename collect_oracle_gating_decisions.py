@@ -43,6 +43,9 @@ class GatingCollector:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        # Load model with device_map="auto" for efficient loading
+        # Note: This may cause slightly different gating decisions vs FiddlerQwen
+        # due to device placement differences, but oracle still represents upper bound
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             trust_remote_code=True,
@@ -94,7 +97,10 @@ class GatingCollector:
 
     def _capture_gating(self, hidden_states, layer_idx):
         """Capture gating decisions for this layer."""
-        if self.current_prompt_idx is None:
+        # Check if we're in collection mode (either single or batch)
+        if self.current_prompt_idx is None and not hasattr(self, 'current_batch_indices'):
+            return
+        if hasattr(self, 'current_batch_indices') and self.current_batch_indices is None:
             return
 
         moe_layer = self.model.model.layers[layer_idx].mlp
@@ -116,6 +122,16 @@ class GatingCollector:
         # Store gating decisions
         # selected_experts shape: [batch*seq_len, top_k]
         for batch_idx in range(batch_size):
+            # Determine prompt index for this batch item
+            if hasattr(self, 'current_batch_indices') and self.current_batch_indices:
+                # Batched collection
+                if batch_idx >= len(self.current_batch_indices):
+                    continue
+                prompt_idx = self.current_batch_indices[batch_idx]
+            else:
+                # Single prompt collection
+                prompt_idx = self.current_prompt_idx
+
             for seq_idx in range(sequence_length):
                 flat_idx = batch_idx * sequence_length + seq_idx
                 expert_ids = selected_experts_np[flat_idx].tolist()
@@ -131,12 +147,12 @@ class GatingCollector:
                     token_pos = self.current_token_pos
 
                 # Store decision
-                if self.current_prompt_idx not in self.gating_decisions:
-                    self.gating_decisions[self.current_prompt_idx] = {}
-                if layer_idx not in self.gating_decisions[self.current_prompt_idx]:
-                    self.gating_decisions[self.current_prompt_idx][layer_idx] = {}
+                if prompt_idx not in self.gating_decisions:
+                    self.gating_decisions[prompt_idx] = {}
+                if layer_idx not in self.gating_decisions[prompt_idx]:
+                    self.gating_decisions[prompt_idx][layer_idx] = {}
 
-                self.gating_decisions[self.current_prompt_idx][layer_idx][token_pos] = expert_ids
+                self.gating_decisions[prompt_idx][layer_idx][token_pos] = expert_ids
 
     def collect_for_prompt(self, prompt: str, output_tokens: int, prompt_idx: int):
         """
@@ -167,8 +183,8 @@ class GatingCollector:
 
             for token_idx in range(output_tokens):
                 # Update token position for decode phase
-                if token_idx > 0 or prefill_length == 1:
-                    self.current_token_pos = prefill_length + token_idx
+                # First decode token is at position prefill_length, second at prefill_length+1, etc.
+                self.current_token_pos = prefill_length + token_idx
 
                 # Generate next token
                 outputs = self.model(
@@ -207,6 +223,7 @@ class GatingCollector:
     def collect_for_batch(self, batch_size: int, output_tokens: int, seed: int = None):
         """
         Collect gating decisions for a batch of diverse prompts.
+        Processes prompts TOGETHER as a batch to match benchmark behavior.
 
         Args:
             batch_size: Number of prompts in the batch
@@ -215,9 +232,67 @@ class GatingCollector:
         """
         prompts = get_diverse_batch(batch_size, seed=seed)
 
+        print(f"\nCollecting gating for BATCHED prompts (batch_size={batch_size}, seed={seed})")
         for idx, prompt in enumerate(prompts):
-            prompt_idx = f"bs{batch_size}_seed{seed}_prompt{idx}"
-            self.collect_for_prompt(prompt, output_tokens, prompt_idx)
+            print(f"  [{idx}]: '{prompt[:50]}...'")
+
+        # Set up prompt indices for storage
+        prompt_indices = [f"bs{batch_size}_seed{seed}_prompt{idx}" for idx in range(len(prompts))]
+
+        # Mark all as active for capture
+        self.current_batch_indices = prompt_indices
+        self.current_token_pos = 0
+
+        # Tokenize batch with padding
+        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+        input_ids = inputs.input_ids.to(self.device)
+        attention_mask = inputs.attention_mask.to(self.device)
+
+        prefill_length = input_ids.shape[1]
+
+        with torch.no_grad():
+            # Generate tokens
+            current_input_ids = input_ids
+            current_attention_mask = attention_mask
+
+            for token_idx in range(output_tokens):
+                # Update token position for decode phase
+                # First decode token is at position prefill_length, second at prefill_length+1, etc.
+                self.current_token_pos = prefill_length + token_idx
+
+                # Generate next token for batch
+                outputs = self.model(
+                    input_ids=current_input_ids,
+                    attention_mask=current_attention_mask,
+                    use_cache=True
+                )
+
+                # Get next tokens for all items in batch
+                next_token_logits = outputs.logits[:, -1, :]
+                next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+
+                # Append to inputs
+                current_input_ids = torch.cat([current_input_ids, next_tokens], dim=-1)
+                current_attention_mask = torch.cat([
+                    current_attention_mask,
+                    torch.ones((batch_size, 1), dtype=current_attention_mask.dtype, device=self.device)
+                ], dim=-1)
+
+                # Clear cache
+                if hasattr(outputs, 'past_key_values'):
+                    del outputs.past_key_values
+
+        # Clear cache
+        torch.cuda.empty_cache()
+
+        # Verify capture
+        for idx, prompt_idx in enumerate(prompt_indices):
+            total_positions = len(self.gating_decisions.get(prompt_idx, {}).get(self.moe_layers[0], {}))
+            print(f"  Prompt {idx}: Captured {total_positions} token positions")
+
+        # Reset
+        self.current_batch_indices = None
+        self.current_token_pos = 0
 
     def save(self, output_path: str):
         """Save collected gating decisions to JSON file."""
