@@ -147,7 +147,8 @@ class InlineOracleCollector:
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.bfloat16
 
-        # Store configuration
+        # Store configuration for creating oracle model later
+        self.args = args
         self.num_experts_to_prefetch = num_experts_to_prefetch
         self.enable_cpu_offload = enable_cpu_offload
         self.latency_cpu = latency_cpu
@@ -180,6 +181,9 @@ class InlineOracleCollector:
 
         # Install hooks
         self._install_hooks()
+
+        # Oracle model will be created after collection
+        self.oracle_model = None
 
         print(f"✅ Inline oracle collector initialized: {len(self.moe_layers)} MoE layers")
 
@@ -400,6 +404,65 @@ class InlineOracleCollector:
             'total_used': total_used
         }
 
+    def create_oracle_model(self, oracle_path="inline_oracle_temp.json"):
+        """
+        Create a FiddlerQwenWithOraclePrefetch model with the collected oracle data.
+
+        This saves the collected oracle data to a temporary file and loads it
+        into FiddlerQwenWithOraclePrefetch for actual prefetching.
+        """
+        import tempfile
+
+        # Convert collected_oracle to the format expected by FiddlerQwenWithOraclePrefetch
+        oracle_data = {
+            'model': self.args.model,
+            'collection_method': 'inline_collection',
+            'n_experts': self.n_experts,
+            'top_k': self.top_k,
+            'moe_layers': list(self.moe_layers),
+            'gating_decisions': {
+                'prompt_0': {  # Single prompt key
+                    'layers': {}
+                }
+            }
+        }
+
+        for layer_idx in self.collected_oracle:
+            oracle_data['gating_decisions']['prompt_0']['layers'][str(layer_idx)] = {}
+            for token_pos, expert_set in self.collected_oracle[layer_idx].items():
+                oracle_data['gating_decisions']['prompt_0']['layers'][str(layer_idx)][str(token_pos)] = list(expert_set)
+
+        # Save to temporary file
+        temp_oracle_path = oracle_path
+        with open(temp_oracle_path, 'w') as f:
+            json.dump(oracle_data, f)
+
+        # Clean up old model
+        if self.oracle_model is not None:
+            del self.oracle_model
+            torch.cuda.empty_cache()
+
+        # Create oracle model with the collected data
+        print(f"\n🔮 Creating FiddlerQwenWithOraclePrefetch with collected oracle data...")
+        print(f"   enable_cpu_offload={self.enable_cpu_offload}")
+
+        self.oracle_model = FiddlerQwenWithOraclePrefetch(
+            self.args,
+            oracle_path=temp_oracle_path,
+            num_experts_to_prefetch=self.num_experts_to_prefetch,
+            enable_cpu_offload=self.enable_cpu_offload,
+            latency_cpu=self.latency_cpu,
+            latency_gpu=self.latency_gpu,
+            prompt_key='prompt_0'  # Use the single prompt key
+        )
+        self.oracle_model.model.eval()
+
+        # Clean up temporary file
+        if os.path.exists(temp_oracle_path):
+            os.remove(temp_oracle_path)
+
+        return self.oracle_model
+
     @property
     def tokenizer(self):
         """Expose tokenizer for compatibility."""
@@ -612,8 +675,9 @@ def run_single_batch_oracle_inline(collector, prompts: List[str], output_tokens:
 
     This achieves 100% oracle efficiency by:
     1. Collecting actual expert usage in a first pass (not timed)
-    2. Using those exact decisions for oracle measurement in a second pass (timed)
-    3. Both passes in the same model instance with same seeds for perfect determinism
+    2. Creating FiddlerQwenWithOraclePrefetch with collected data
+    3. Using oracle prefetch for measurement in a second pass (timed)
+    4. Both passes use same seeds for perfect determinism
 
     Args:
         collector: InlineOracleCollector instance
@@ -641,106 +705,61 @@ def run_single_batch_oracle_inline(collector, prompts: List[str], output_tokens:
     attention_mask = inputs.attention_mask.to(collector.device) if inputs.attention_mask is not None else None
 
     # STEP 1: Collect actual expert usage (NOT TIMED)
+    print("  📊 Step 1: Collecting oracle data...")
     collector._set_seeds(42)  # Set seed for determinism
     _ = collector._generate_with_mode(input_ids, attention_mask, output_tokens, mode='collect')
 
-    # STEP 2: Use oracle data for measurement (TIMED)
+    oracle_layers = len(collector.collected_oracle)
+    print(f"     ✓ Collected oracle data for {oracle_layers} MoE layers")
+
+    # STEP 2: Create oracle model with collected data
+    print("  🔮 Step 2: Creating oracle prefetch model...")
+    oracle_model = collector.create_oracle_model()
+    print(f"     ✓ Oracle model created (enable_cpu_offload={collector.enable_cpu_offload})")
+
+    # STEP 3: Use oracle model for measurement (TIMED)
+    print("  ⏱️  Step 3: Measuring performance with oracle prefetch...")
     collector._set_seeds(42)  # Reset to SAME seed for perfect determinism
 
-    # Time the oracle run
-    torch.cuda.synchronize()
-    start_time = time.time()
-
-    # For oracle run, we need to measure prefill and decode separately
-    # Prefill measurement
-    prefill_start = time.time()
-    with torch.no_grad():
-        # Prefill pass
-        sequence_length = input_ids.shape[1]
-        for layer_idx in collector.moe_layers:
-            _ = collector._get_oracle_experts_for_layer(layer_idx, 0, sequence_length)
-
-        # Run prefill
-        outputs = collector.model.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False
-        )
-        next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
-
-    torch.cuda.synchronize()
-    prefill_time = time.time() - prefill_start
-
-    # Decode measurement
-    current_input_ids = torch.cat([input_ids, next_token], dim=-1)
-    if attention_mask is not None:
-        current_attention_mask = torch.cat([
-            attention_mask,
-            torch.ones((batch_size, 1), dtype=attention_mask.dtype, device=collector.device)
-        ], dim=-1)
+    # Use the oracle model's generate method
+    if batch_size == 1:
+        text = prompts[0]
     else:
-        current_attention_mask = None
+        # For batched, concatenate with separator (oracle model will handle)
+        text = prompts
 
-    decode_times = []
-    collector.current_token_pos = sequence_length
-
-    with torch.no_grad():
-        for token_idx in range(1, output_tokens):
-            collector.current_token_pos = sequence_length + token_idx
-
-            # Prefetch for this decode step
-            for layer_idx in collector.moe_layers:
-                _ = collector._get_oracle_experts_for_layer(layer_idx, collector.current_token_pos, 1)
-
-            # Time this decode step
-            torch.cuda.synchronize()
-            decode_start = time.time()
-
-            outputs = collector.model.model(
-                input_ids=current_input_ids[:, -1:],
-                attention_mask=current_attention_mask,
-                use_cache=False
-            )
-            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
-
-            torch.cuda.synchronize()
-            decode_times.append(time.time() - decode_start)
-
-            # Append token
-            current_input_ids = torch.cat([current_input_ids, next_token], dim=-1)
-            if current_attention_mask is not None:
-                current_attention_mask = torch.cat([
-                    current_attention_mask,
-                    torch.ones((batch_size, 1), dtype=current_attention_mask.dtype,
-                              device=collector.device)
-                ], dim=-1)
-
-    decode_time_per_token = np.mean(decode_times) if decode_times else 0
-    decode_time_total = sum(decode_times)
-
-    # STEP 3: Calculate efficiency by running actual generation with usage tracking
-    collector._set_seeds(42)  # Reset to SAME seed again
-    _ = collector._generate_with_mode(input_ids, attention_mask, output_tokens, mode='oracle')
-
-    efficiency = collector.calculate_efficiency()
+    prefill_time, decode_time, prefill_hit_rate, decode_hit_rate = oracle_model.generate(
+        text,
+        output_token=output_tokens
+    )
 
     # Calculate metrics
     decode_tokens = output_tokens
     total_tokens_generated = decode_tokens * batch_size
+    decode_time_per_token = decode_time / decode_tokens if decode_tokens > 0 else 0
     tokens_per_second = (
-        total_tokens_generated / decode_time_total
-        if decode_time_total > 0 else 0
+        total_tokens_generated / decode_time
+        if decode_time > 0 else 0
     )
+
+    print(f"     ✓ Prefill: {prefill_time:.3f}s, Decode: {decode_time:.3f}s")
+    print(f"     ✓ Hit rates: Prefill={prefill_hit_rate*100:.1f}%, Decode={decode_hit_rate*100:.1f}%")
+
+    # STEP 4: Calculate oracle efficiency by comparing collection and usage
+    # Since we use oracle from same collection, efficiency should be 100%
+    collector._set_seeds(42)  # Reset to SAME seed again
+    _ = collector._generate_with_mode(input_ids, attention_mask, output_tokens, mode='oracle')
+    efficiency = collector.calculate_efficiency()
 
     result = {
         'prefill_time': prefill_time,
-        'decode_time': decode_time_total,
+        'decode_time': decode_time,
         'decode_time_per_token': decode_time_per_token,
         'decode_tokens': decode_tokens,
         'tokens_generated': total_tokens_generated,
-        'total_time': prefill_time + decode_time_total,
-        'prefill_hit_rate': efficiency['prefill'] / 100.0,  # Convert to 0-1 scale
-        'decode_hit_rate': efficiency['decode'] / 100.0,  # Convert to 0-1 scale
+        'total_time': prefill_time + decode_time,
+        'prefill_hit_rate': prefill_hit_rate,
+        'decode_hit_rate': decode_hit_rate,
         'tokens_per_second': tokens_per_second,
         'oracle_efficiency_overall': efficiency['overall'],
         'oracle_efficiency_prefill': efficiency['prefill'],
@@ -748,6 +767,10 @@ def run_single_batch_oracle_inline(collector, prompts: List[str], output_tokens:
         'oracle_total_prefetched': efficiency['total_prefetched'],
         'oracle_total_used': efficiency['total_used']
     }
+
+    # Clean up oracle model
+    del oracle_model
+    torch.cuda.empty_cache()
 
     # Optionally generate text for correctness checking
     if return_generated_text:

@@ -7,6 +7,48 @@ Don't stop till you achieve the goal in a reliable way without shortcuts or work
 
 ## Current Goal
 
+Run a comprehensive benchmark comparing learned predictor performance against oracle upper bounds at different batch sizes to understand the practical gap and identify optimization opportunities.
+
+## Previous Goals
+
+✅ **COMPLETED (2025-10-19)**: Fixed Oracle-Prefetch (Inline) implementation bug
+
+**Problem Identified**:
+Oracle-Prefetch (Inline) and Fiddler+Oracle-Prefetch (Inline) had identical performance in phase5_benchmark_20251019_200521:
+- BS=16: Oracle decode = 4.723s, Fiddler+Oracle decode = 4.737s (< 0.3% difference)
+- Expected: Different performance since one uses CPU offloading and one doesn't
+
+**Root Cause**:
+InlineOracleCollector was collecting oracle data but **not actually using it for prefetching**:
+- Used base FiddlerQwen for all timing measurements (no prefetch support)
+- Ignored `enable_cpu_offload` parameter completely
+- Called `_get_oracle_experts_for_layer()` only for tracking, not actual prefetching
+
+**Solution Implemented**:
+1. Added `create_oracle_model()` method to InlineOracleCollector
+   - Converts collected oracle data to proper JSON format
+   - Creates FiddlerQwenWithOraclePrefetch with collected data
+   - Properly passes `enable_cpu_offload` parameter
+
+2. Rewrote `run_single_batch_oracle_inline()` function:
+   - Step 1: Collect oracle data using base FiddlerQwen (not timed)
+   - Step 2: Create FiddlerQwenWithOraclePrefetch with collected data
+   - Step 3: Use oracle model's `generate()` method for timed measurement
+   - Step 4: Calculate efficiency (achieves 100%)
+
+**Results Verified**:
+Quick test showed the fix works:
+- Oracle-Prefetch (Inline) decode time: 0.101s (no CPU offload)
+- Fiddler+Oracle-Prefetch (Inline) decode time: 0.048s (with CPU offload)
+- ✅ Speedup: 2.10x at BS=1 (confirms configurations are now different)
+
+**Files Modified**:
+- `benchmark_prediction_methods.py` - Fixed InlineOracleCollector implementation
+- `ORACLE_INLINE_FIX.md` - Detailed documentation of the fix
+- `test_inline_oracle_fix.py` - Quick validation test
+
+**Status**: Full benchmark running to confirm fix across all batch sizes
+
 ✅ **COMPLETED (2025-10-19)**: Successfully adopted inline oracle implementation into benchmark_prediction_methods.py
 
 **What was done**:
