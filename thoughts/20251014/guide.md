@@ -7,9 +7,46 @@ Don't stop till you achieve the goal in a reliable way without shortcuts or work
 
 ## Current Goal
 
-✅ **COMPLETED**: Achieved 100% Oracle Prefetch Efficiency by implementing inline oracle collection!
+✅ **COMPLETED (2025-10-19)**: Successfully adopted inline oracle implementation into benchmark_prediction_methods.py
+
+**What was done**:
+1. ✅ Created `InlineOracleCollector` class in benchmark_prediction_methods.py
+   - Captures gating decisions inline during generation
+   - Collects oracle data in same model instance for perfect determinism
+   - Achieves 100% oracle efficiency
+
+2. ✅ Implemented `run_single_batch_oracle_inline()` function
+   - Performs 3 passes: collection (not timed), measurement (timed), validation (not timed)
+   - Time measurements exclude oracle collection pass
+   - Returns efficiency metrics alongside timing metrics
+
+3. ✅ Modified `run_configuration()` to support inline oracle
+   - Added `use_inline_oracle` parameter
+   - Automatically uses `InlineOracleCollector` when enabled
+
+4. ✅ Updated main benchmark configurations
+   - Added "Oracle-Prefetch (Inline)" configuration
+   - Added "Fiddler+Oracle-Prefetch (Inline)" configuration
+   - Both use `num_experts_to_prefetch=4` to match Qwen's top-4
+
+5. ✅ Validated results with quick test (test_inline_oracle_quick.py)
+   - Batch Size 1: 100.0% efficiency (1824 prefetched, 1824 used)
+   - Batch Size 2: 100.0% efficiency (1824 prefetched, 1824 used)
+   - Batch Size 4: 100.0% efficiency (1824 prefetched, 1824 used)
+
+**Key Achievement**: Oracle prefetching now achieves TRUE 100% efficiency by eliminating cross-run non-determinism through inline collection.
+
+**Files Modified**:
+- `benchmark_prediction_methods.py` - Added inline oracle collection support
+- `test_inline_oracle_quick.py` - Quick validation script (NEW)
+
+**Next Steps**: The benchmark script will now produce oracle results with 100% efficiency, providing a true upper bound for prefetch performance.
+
+
 
 **Previous Goal**: Implement Option 1 of the solution required to achieve 100% Oracle Prefetch Efficiency by collecting oracle data inline during the benchmark run.
+
+✅ **COMPLETED**: Achieved 100% Oracle Prefetch Efficiency by implementing inline oracle collection!
 
 **Status**: Successfully implemented and verified for all batch sizes (1, 2, 4, 8, 16)
 
