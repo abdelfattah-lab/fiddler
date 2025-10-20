@@ -37,10 +37,29 @@ Don't stop till you achieve the goal in a reliable way without shortcuts or work
 **Key Achievement**: Oracle prefetching now achieves TRUE 100% efficiency by eliminating cross-run non-determinism through inline collection.
 
 **Files Modified**:
-- `benchmark_prediction_methods.py` - Added inline oracle collection support
+- `benchmark_prediction_methods.py` - Added inline oracle collection support + CSV bug fix
 - `test_inline_oracle_quick.py` - Quick validation script (NEW)
+- `visualize_saved_results.py` - Script to visualize saved results (NEW)
 
-**Next Steps**: The benchmark script will now produce oracle results with 100% efficiency, providing a true upper bound for prefetch performance.
+**Bug Fixed**:
+- Fixed CSV writing error where oracle efficiency fields were missing from fieldnames
+- CSV writer now collects ALL unique fieldnames from all results before writing
+
+**Benchmark Results** (`phase5_benchmark_20251019_200521/`):
+- ✅ All inline oracle configs achieve 100.0% efficiency
+- ✅ Oracle-Prefetch (Inline) shows upper bound: up to 3.85x decode speedup at BS=16
+- ✅ Fiddler+Oracle-Prefetch (Inline) shows identical performance (confirms no benefit from CPU offload when oracle is perfect)
+- ✅ Fiddler+Learned-Prefetch WINS at BS=4,8,16 with up to 1.20x speedup over Fiddler alone
+- ✅ Learned predictor achieves 100% decode hit rate at all batch sizes
+- 📊 Visualizations and analysis generated successfully
+
+**Key Insights**:
+1. Inline oracle collection eliminates ~2% efficiency loss from cross-run non-determinism
+2. Oracle prefetch provides upper bound: 3.85x speedup at BS=16 (67.8 tok/s vs 16.7 tok/s baseline)
+3. Learned predictor achieves practical speedups: 1.20x at BS=4, 1.13x at BS=8, 1.06x at BS=16
+4. At BS=1, CPU-only Fiddler (19.9 tok/s) is better than any prefetch approach
+
+**Next Steps**: See `thoughts/20251014/next_goal.md` for disk offloading implementation.
 
 
 

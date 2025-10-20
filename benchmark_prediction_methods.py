@@ -1825,7 +1825,12 @@ def main():
     if all_results:
         csv_path = os.path.join(output_dir, 'benchmark_results.csv')
         with open(csv_path, 'w', newline='') as f:
-            fieldnames = list(all_results[0].keys())
+            # Collect all unique fieldnames from all results (handles oracle efficiency fields)
+            fieldnames_set = set()
+            for result in all_results:
+                fieldnames_set.update(result.keys())
+            fieldnames = sorted(list(fieldnames_set))
+
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(all_results)
